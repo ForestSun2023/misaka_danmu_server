@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSON
 from fastapi.middleware.cors import CORSMiddleware  # 新增：处理跨域
 import json
 from .config_manager import ConfigManager
-from .database import init_db_tables, close_db_engine, create_initial_admin_user
-from .api import api_router
+from .database import init_db_tables, close_db_engine, create_initial_admin_user # type: ignore
+from .api import api_router, control_router
 from .dandan_api import dandan_router
 from .task_manager import TaskManager
 from .metadata_manager import MetadataSourceManager
@@ -20,6 +20,7 @@ from .webhook_manager import WebhookManager
 from .scheduler import SchedulerManager
 from .config import settings
 from . import crud, security
+from . import migration
 from .log_manager import setup_logging
 from .rate_limiter import RateLimiter
 
@@ -40,6 +41,9 @@ async def lifespan(app: FastAPI):
     # init_db_tables 现在处理数据库创建、引擎和会话工厂的创建
     await init_db_tables(app)
     session_factory = app.state.db_session_factory
+
+    # 新增：在所有管理器初始化之前，执行数据库迁移
+    await migration.run_db_migration(session_factory)
 
     # 新增：在启动时清理任何未完成的任务
     async with session_factory() as session:
@@ -85,19 +89,29 @@ async def lifespan(app: FastAPI):
         'gamerUserAgent': ('', '用于访问巴哈姆特动画疯的User-Agent。'),
         "rate_limit_global_limit": ("50", ""),
         "rate_limit_global_period_seconds": ("3600", ""),
+        # 全局过滤
+        'search_result_global_blacklist_cn': (r'特典|预告|广告|菜单|花絮|特辑|速看|资讯|彩蛋|直拍|直播回顾|片头|片尾|幕后|映像|番外篇|纪录片|访谈|番外|短片|加更|走心|解忧|纯享|解读|揭秘|赏析', '用于过滤搜索结果标题的全局中文黑名单(正则表达式)。'),
+        'search_result_global_blacklist_eng': (r'NC|OP|ED|SP|OVA|OAD|CM|PV|MV|BDMenu|Menu|Bonus|Recap|Teaser|Trailer|Preview|CD|Disc|Scan|Sample|Logo|Info|EDPV|SongSpot|BDSpot', '用于过滤搜索结果标题的全局英文黑名单(正则表达式)。'),
     }
     await app.state.config_manager.register_defaults(default_configs)
 
-    app.state.scraper_manager = ScraperManager(session_factory, app.state.config_manager)
+    # --- 新的初始化顺序以解决循环依赖 ---
+    # 1. 初始化元数据管理器，但暂时不传入 scraper_manager
+    app.state.metadata_manager = MetadataSourceManager(session_factory, app.state.config_manager, None) # type: ignore
+
+    # 2. 初始化搜索源管理器，并传入元数据管理器
+    app.state.scraper_manager = ScraperManager(session_factory, app.state.config_manager, app.state.metadata_manager)
+
+    # 3. 将 scraper_manager 实例回填到 metadata_manager 中
+    app.state.metadata_manager.scraper_manager = app.state.scraper_manager
+
+    # 4. 现在可以安全地初始化所有管理器
     await app.state.scraper_manager.initialize()
+    await app.state.metadata_manager.initialize()
+
+    # 5. 初始化其他依赖于上述管理器的组件
     app.state.rate_limiter = RateLimiter(session_factory, app.state.config_manager, app.state.scraper_manager)
 
-    # 新增：初始化元数据源管理器
-    app.state.metadata_manager = MetadataSourceManager(session_factory, app.state.config_manager, app.state.scraper_manager)
-    await app.state.metadata_manager.initialize()
-    # 新增：在主应用中显式挂载元数据管理器的路由
-    # 这使得路由结构更清晰，并解决了潜在的冲突问题
-    # 必须在管理器初始化之后挂载，以确保其内部路由已构建
     app.include_router(app.state.metadata_manager.router, prefix="/api/metadata")
 
 
@@ -128,13 +142,15 @@ async def lifespan(app: FastAPI):
         app.mount("/assets", StaticFiles(directory="web/dist/assets"), name="assets")
         # 修正：挂载前端的静态图片 (如 logo)，使其指向正确的 'web/dist/images' 目录
         app.mount("/images", StaticFiles(directory="web/dist/images"), name="images")
+        # dist挂载
+        app.mount("/dist", StaticFiles(directory="web/dist"), name="dist")
         # 挂载用户缓存的图片 (如海报)
         app.mount("/data/images", StaticFiles(directory="config/image"), name="cached_images")
         # 然后，为所有其他路径提供 index.html 以支持前端路由
         @app.get("/{full_path:path}", include_in_schema=False)
         async def serve_spa(request: Request, full_path: str):
             return FileResponse("web/dist/index.html")
-
+    
     yield
     
     # --- Shutdown Logic ---
@@ -167,11 +183,8 @@ app = FastAPI(
 # 新增：配置CORS，允许前端开发服务器访问API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        f"http://{settings.client.host}:{settings.client.port}",  # 前端开发服务器
-        "http://localhost:5173",  # 默认Vite开发端口
-        "http://127.0.0.1:5173",
-    ],
+    # 允许所有来源。对于生产环境，建议替换为您的前端域名列表。
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -255,10 +268,16 @@ async def cleanup_task(app: FastAPI):
         except Exception as e:
             logging.getLogger(__name__).error(f"缓存清理任务出错: {e}")
 
+# 新增：显式地挂载外部控制API路由，以确保其优先级
+app.include_router(control_router, prefix="/api/control", tags=["External Control API"])
+
 # 包含所有非 dandanplay 的 API 路由
 app.include_router(api_router, prefix="/api")
 
+
 app.include_router(dandan_router, prefix="/api/v1", tags=["DanDanPlay Compatible"], include_in_schema=False)
+
+
 
 # 添加一个运行入口，以便直接从配置启动
 # 这样就可以通过 `python -m src.main` 来运行，并自动使用 config.yml 中的端口和主机
