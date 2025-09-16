@@ -1,9 +1,11 @@
 import logging
 from typing import Callable
 import asyncio
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
+from sqlalchemy import select, func
 
-from .. import crud
+from fastapi import HTTPException, status
+from .. import crud, orm_models
 from .base import BaseJob
 from ..task_manager import TaskSuccess
 from ..tasks import generic_import_task
@@ -33,14 +35,19 @@ class IncrementalRefreshJob(BaseJob):
                     self.logger.warning(f"无法找到数据源(id={source_id})的信息，跳过。")
                     continue
 
-                # 获取当前最新分集
-                episodes = await crud.get_episodes_for_source(task_session, source_id)
-                latest_episode_index = max((ep['episodeIndex'] for ep in episodes), default=0)
+                # 修正：直接从数据库查询最大分集编号，这比获取所有分集再计算要高效得多，
+                # 并且修复了因 `crud.get_episodes_for_source` 返回格式改变而导致的 TypeError。
+                stmt = select(func.max(orm_models.Episode.episodeIndex)).where(orm_models.Episode.sourceId == source_id)
+                latest_episode_index = (await task_session.execute(stmt)).scalar_one_or_none() or 0
                 
                 next_episode_index = latest_episode_index + 1
                 self.logger.info(f"为 '{source_info['title']}' (源ID: {source_id}) 尝试获取第 {next_episode_index} 集...")
 
+                unique_key = f"import-{source_info['providerName']}-{source_info['mediaId']}-ep{next_episode_index}"
                 task_title = f"定时追更: {source_info['title']} - S{source_info.get('season', 1):02d}E{next_episode_index:02d}"
+                
+                # 生成unique_key用于重复任务检测
+                unique_key = f"incremental-refresh:{source_info['providerName']}:{source_info['mediaId']}:{source_info.get('season', 1)}:{next_episode_index}"
 
                 # 使用闭包捕获当前循环的变量
                 def create_task_coro_factory(info, next_ep):
@@ -55,10 +62,13 @@ class IncrementalRefreshJob(BaseJob):
                     )
                 
                 try:
-                    await self.task_manager.submit_task(create_task_coro_factory(source_info, next_episode_index), task_title)
+                    await self.task_manager.submit_task(create_task_coro_factory(source_info, next_episode_index), task_title, unique_key=unique_key)
                     submitted_count += 1
-                except ValueError as e:
-                    self.logger.info(f"跳过创建任务 '{task_title}'，因为它已在队列中或正在运行。")
+                except HTTPException as e:
+                    if e.status_code == status.HTTP_409_CONFLICT:
+                        self.logger.info(f"跳过创建任务 '{task_title}'，因为它已在队列中或正在运行。")
+                    else:
+                        self.logger.error(f"为源 '{source_info['title']}' (ID: {source_id}) 创建追更任务时发生HTTP错误: {e.detail}")
                 except Exception as e:
                     self.logger.error(f"为源 '{source_info['title']}' (ID: {source_id}) 创建追更任务时失败: {e}")
 

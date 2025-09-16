@@ -39,6 +39,7 @@ import { RoutePaths } from '../../general/RoutePaths'
 import { padStart } from 'lodash'
 import { useModal } from '../../ModalContext'
 import { useMessage } from '../../MessageContext'
+import { useDebounce } from '../../hooks/useDebounce'
 
 const ApplyField = ({ name, label, fetchedValue, form }) => {
   const currentValue = Form.useWatch(name, form)
@@ -65,10 +66,13 @@ const ApplyField = ({ name, label, fetchedValue, form }) => {
 export const Library = () => {
   const [loading, setLoading] = useState(true)
   const [list, setList] = useState([])
-  const [renderData, setRenderData] = useState([])
   const [keyword, setKeyword] = useState('')
   const navigate = useNavigate()
-  const [libraryPageSize, setLibraryPageSize] = useState(50)
+  const [pagination, setPagination] = useState({
+    current: 1,
+    pageSize: 50,
+    total: 0,
+  })
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
 
   const [form] = Form.useForm()
@@ -91,12 +95,18 @@ export const Library = () => {
   const getList = async () => {
     try {
       setLoading(true)
-      const res = await getAnimeLibrary()
-      setList(res.data?.animes || [])
-      setRenderData(res.data?.animes || [])
+      const res = await getAnimeLibrary({
+        keyword: keyword,
+        page: pagination.current,
+        pageSize: pagination.pageSize,
+      })
+      setList(res.data?.list || [])
+      setPagination(prev => ({
+        ...prev,
+        total: res.data?.total || 0,
+      }))
     } catch (error) {
       setList([])
-      setRenderData([])
     } finally {
       setLoading(false)
     }
@@ -104,16 +114,26 @@ export const Library = () => {
 
   const handleCreateSuccess = () => {
     setIsCreateModalOpen(false)
-    getList() // 创建成功后刷新列表
+    setPagination(n => {
+      return {
+        ...n,
+        current: 1,
+      }
+    })
   }
 
   useEffect(() => {
-    getList()
-  }, [])
+    setPagination(n => {
+      return {
+        ...n,
+        current: 1,
+      }
+    })
+  }, [keyword])
 
   useEffect(() => {
-    setRenderData(list?.filter(it => it.title.includes(keyword)) || [])
-  }, [list, keyword])
+    getList()
+  }, [keyword, pagination.current, pagination.pageSize])
 
   useEffect(() => {
     if (!fetchedMetadata) return
@@ -577,6 +597,10 @@ export const Library = () => {
     }
   }
 
+  const handleKeywordChange = useDebounce(e => {
+    setKeyword(e.target.value)
+  }, 500)
+
   const [bgmResult, setBgmResult] = useState([])
   const [bgmOpen, setBgmOpen] = useState(false)
   const [searchBgmLoading, setSearchBgmLoading] = useState(false)
@@ -609,7 +633,7 @@ export const Library = () => {
           <Space>
             <Input
               placeholder="搜索已收录的影视"
-              onChange={e => setKeyword(e.target.value)}
+              onChange={e => handleKeywordChange(e)}
             />
             <Button type="primary" onClick={() => setIsCreateModalOpen(true)}>
               自定义影视条目
@@ -617,23 +641,32 @@ export const Library = () => {
           </Space>
         }
       >
-        {!!renderData?.length ? (
+        {!!list?.length ? (
           <Table
-            pagination={
-              renderData?.length > 50
-                ? {
-                    pageSize: libraryPageSize,
-                    showTotal: total => `共 ${total} 条数据`,
-                    showSizeChanger: true,
-                    showQuickJumper: true,
-                    onShowSizeChange: (_, size) => {
-                      setLibraryPageSize(size)
-                    },
+            pagination={{
+              ...pagination,
+              showTotal: total => `共 ${total} 条数据`,
+              onChange: (page, pageSize) => {
+                setPagination(n => {
+                  return {
+                    ...n,
+                    current: page,
+                    pageSize,
                   }
-                : null
-            }
+                })
+              },
+              onShowSizeChange: (_, size) => {
+                setPagination(n => {
+                  return {
+                    ...n,
+                    pageSize: size,
+                  }
+                })
+              },
+              hideOnSinglePage: true,
+            }}
             size="small"
-            dataSource={renderData}
+            dataSource={list}
             columns={columns}
             rowKey={'animeId'}
             scroll={{ x: '100%' }}

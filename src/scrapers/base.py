@@ -96,28 +96,39 @@ class BaseScraper(ABC):
         self._session_factory = session_factory
         self.config_manager = config_manager
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.client: Optional[httpx.AsyncClient] = None
+        # 新增：用于跟踪当前客户端实例所使用的代理配置
+        self._current_proxy_config: Optional[str] = None
 
-    async def _create_client(self, **kwargs) -> httpx.AsyncClient:
+    async def _get_proxy_for_provider(self) -> Optional[str]:
+        """Helper to get the configured proxy URL for the current provider, if any."""
+        proxy_url = await self.config_manager.get("proxyUrl", "")
+        proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
+
+        if not proxy_enabled_globally or not proxy_url:
+            return None
+
+        async with self._session_factory() as session:
+            scraper_settings = await crud.get_all_scraper_settings(session)
+        
+        provider_setting = next((s for s in scraper_settings if s['providerName'] == self.provider_name), None)
+        use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+
+        return proxy_url if use_proxy_for_this_provider else None
+    async def _log_proxy_usage(self, proxy_url: Optional[str]):
+        if proxy_url:
+            self.logger.debug(f"通过代理 '{proxy_url}' 发起请求...")
+
+    async def _create_client(self, **kwargs) -> httpx.AsyncClient: # type: ignore
         """
         创建 httpx.AsyncClient，并根据配置应用代理。
         子类可以传递额外的 httpx.AsyncClient 参数。
         """
-        proxy_url_task = self.config_manager.get("proxy_url", "")
-        proxy_enabled_globally_task = self.config_manager.get("proxy_enabled", "false")
-
-        async with self._session_factory() as session:
-            scraper_settings_task = crud.get_all_scraper_settings(session)
-            proxy_url, proxy_enabled_str, scraper_settings = await asyncio.gather(
-                proxy_url_task, proxy_enabled_globally_task, scraper_settings_task
-            )
-        proxy_enabled_globally = proxy_enabled_str.lower() == 'true'
-
-        provider_setting = next((s for s in scraper_settings if s['providerName'] == self.provider_name), None)
-        use_proxy_for_this_provider = provider_setting.get('use_proxy', False) if provider_setting else False
-
-        proxy_to_use = proxy_url if proxy_enabled_globally and use_proxy_for_this_provider and proxy_url else None
-
+        proxy_to_use = await self._get_proxy_for_provider()
+        await self._log_proxy_usage(proxy_to_use)
+        
+        # 关键：在创建客户端后，记录下当前使用的代理配置
+        self._current_proxy_config = proxy_to_use
+        
         client_kwargs = {"proxy": proxy_to_use, "timeout": 20.0, "follow_redirects": True, **kwargs}
         return httpx.AsyncClient(**client_kwargs)
 
@@ -155,10 +166,10 @@ class BaseScraper(ABC):
         """动态检查是否应记录原始响应，确保配置实时生效。"""
         if not self.is_loggable:
             return False
-        
-        # 修正：将配置键名标准化为 snake_case (log_raw_responses)，以提高项目内一致性。
-        # 之前的键名 "logRawResponses" 可能与前端或数据库中的实际键名不匹配。
-        is_enabled_str = await self.config_manager.get("log_raw_responses", "false")
+
+        # 修正：使用特定于提供商的配置键，例如 'scraper_tencent_log_responses'
+        config_key = f"scraper_{self.provider_name}_log_responses"
+        is_enabled_str = await self.config_manager.get(config_key, "false")
         # 健壮性检查：同时处理布尔值和字符串 "true"，以防配置值类型不确定。
         if isinstance(is_enabled_str, bool):
             return is_enabled_str
@@ -258,7 +269,5 @@ class BaseScraper(ABC):
 
     @abstractmethod
     async def close(self):
-        """
-        关闭所有打开的资源，例如HTTP客户端。
-        """
-        raise NotImplementedError
+        """关闭所有打开的资源，例如HTTP客户端。"""
+        pass

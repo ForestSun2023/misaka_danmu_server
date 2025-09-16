@@ -7,6 +7,7 @@ import {
   getAnimeDetail,
   getAnimeSource,
   getEpisodes,
+  offsetEpisodes,
   manualImportEpisode,
   refreshEpisodeDanmaku,
   resetEpisode,
@@ -30,7 +31,11 @@ import {
 } from 'antd'
 import dayjs from 'dayjs'
 import { MyIcon } from '@/components/MyIcon'
-import { HomeOutlined, UploadOutlined } from '@ant-design/icons'
+import {
+  HomeOutlined,
+  UploadOutlined,
+  VerticalAlignMiddleOutlined,
+} from '@ant-design/icons'
 import { RoutePaths } from '../../general/RoutePaths'
 import { useModal } from '../../ModalContext'
 import { useMessage } from '../../MessageContext'
@@ -48,6 +53,11 @@ export const EpisodeDetail = () => {
   const [episodeList, setEpisodeList] = useState([])
   const [selectedRows, setSelectedRows] = useState([])
   const [sourceInfo, setSourceInfo] = useState({})
+  const [pagination, setPagination] = useState({
+    current: 1,
+    pageSize: 50,
+    total: 0,
+  })
 
   const [form] = Form.useForm()
   const [editOpen, setEditOpen] = useState(false)
@@ -77,13 +87,19 @@ export const EpisodeDetail = () => {
         }),
         getEpisodes({
           sourceId: Number(id),
+          page: pagination.current,
+          pageSize: pagination.pageSize,
         }),
         getAnimeSource({
           animeId: Number(animeId),
         }),
       ])
       setAnimeDetail(detailRes.data)
-      setEpisodeList(episodeRes.data)
+      setEpisodeList(episodeRes.data?.list || [])
+      setPagination(prev => ({
+        ...prev,
+        total: episodeRes.data?.total || 0,
+      }))
       setSourceInfo({
         ...sourceRes?.data?.filter(it => it.sourceId === Number(id))?.[0],
         animeName: detailRes.data?.title,
@@ -96,7 +112,7 @@ export const EpisodeDetail = () => {
 
   useEffect(() => {
     getDetail()
-  }, [])
+  }, [pagination.current, pagination.pageSize])
 
   const handleBatchImportSuccess = task => {
     setIsBatchModalOpen(false)
@@ -376,6 +392,46 @@ export const EpisodeDetail = () => {
     }
   }
 
+  const handleOffset = () => {
+    let offsetValue = 0
+    modalApi.confirm({
+      title: '集数偏移',
+      icon: <VerticalAlignMiddleOutlined />,
+      zIndex: 1002,
+      content: (
+        <div className="mt-4">
+          <p>请输入一个整数作为偏移量（可为负数）。</p>
+          <p className="text-gray-500 text-xs">
+            例如：输入 12 会将第 1 集变为第 13 集。
+          </p>
+          <InputNumber
+            placeholder="输入偏移量, e.g., 12 or -5"
+            onChange={value => (offsetValue = value)}
+            style={{ width: '100%' }}
+            autoFocus
+          />
+        </div>
+      ),
+      onOk: async () => {
+        if (!offsetValue || !Number.isInteger(offsetValue)) {
+          messageApi.warning('请输入一个有效的整数偏移量。')
+          return
+        }
+        try {
+          const res = await offsetEpisodes({
+            episodeIds: selectedRows.map(it => it.episodeId),
+            offset: offsetValue,
+          })
+          goTask(res)
+        } catch (error) {
+          messageApi.error(error?.detail || '提交任务失败')
+        }
+      },
+      okText: '确认',
+      cancelText: '取消',
+    })
+  }
+
   const handleResetEpisode = () => {
     modalApi.confirm({
       title: '重整集数',
@@ -522,6 +578,16 @@ export const EpisodeDetail = () => {
           </Button>
           <div className="w-full flex items-center justify-between flex-wrap md:flex-nowrap md:justify-end gap-2 mb-4">
             <Button
+              onClick={handleOffset}
+              disabled={!selectedRows.length}
+              type="primary"
+            >
+              <Tooltip title="对所有选中的分集应用一个集数偏移量">
+                <VerticalAlignMiddleOutlined />
+                <span className="ml-1">集数偏移</span>
+              </Tooltip>
+            </Button>
+            <Button
               onClick={() => {
                 const validCounts = episodeList
                   .map(ep => Number(ep.commentCount))
@@ -591,7 +657,28 @@ export const EpisodeDetail = () => {
         {!!episodeList?.length ? (
           <Table
             rowSelection={{ type: 'checkbox', ...rowSelection }}
-            pagination={false}
+            pagination={{
+              ...pagination,
+              showTotal: total => `共 ${total} 条数据`,
+              onChange: (page, pageSize) => {
+                setPagination(n => {
+                  return {
+                    ...n,
+                    current: page,
+                    pageSize,
+                  }
+                })
+              },
+              onShowSizeChange: (_, size) => {
+                setPagination(n => {
+                  return {
+                    ...n,
+                    pageSize: size,
+                  }
+                })
+              },
+              hideOnSinglePage: true,
+            }}
             size="small"
             dataSource={episodeList}
             columns={columns}

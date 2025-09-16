@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlencode
 
@@ -10,7 +10,7 @@ import httpx
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .. import crud, models, orm_models, security
@@ -18,6 +18,7 @@ from ..config import settings
 from ..config_manager import ConfigManager
 from ..database import get_db_session
 from ..utils import parse_search_keyword
+from ..timezone import get_app_timezone, get_now
 from ..scraper_manager import ScraperManager
 from .base import BaseMetadataSource
 
@@ -89,7 +90,7 @@ class BangumiSearchSubject(BaseModel):
     def details_string(self) -> str:
         parts = []
         if self.date:
-            try: parts.append(datetime.fromisoformat(self.date).strftime('%Y年%m月%d日'))
+            try: parts.append(date.fromisoformat(self.date).strftime('%Y年%m月%d日'))
             except (ValueError, TypeError): parts.append(self.date)
 
         if self.infobox:
@@ -119,7 +120,8 @@ async def _get_bangumi_auth(session: AsyncSession, user_id: int) -> Dict[str, An
     if not auth:
         return {"isAuthenticated": False}
     
-    if auth.expiresAt and auth.expiresAt.replace(tzinfo=None) < datetime.utcnow():
+    # 修正：由于所有时间都以 naive UTC-like 形式存储，直接与当前的 naive UTC-like 时间比较
+    if auth.expiresAt and auth.expiresAt < get_now():
         return {"isAuthenticated": False, "isExpired": True}
 
     return {
@@ -136,9 +138,9 @@ async def _save_bangumi_auth(session: AsyncSession, user_id: int, auth_data: Dic
     if existing_auth:
         for key, value in auth_data.items():
             setattr(existing_auth, key, value)
-        existing_auth.authorizedAt = datetime.utcnow()
+        existing_auth.authorizedAt = get_now()
     else:
-        new_auth = orm_models.BangumiAuth(userId=user_id, **auth_data, authorizedAt=datetime.utcnow())
+        new_auth = orm_models.BangumiAuth(userId=user_id, **auth_data, authorizedAt=get_now())
         session.add(new_auth)
     await session.flush()
 
@@ -183,7 +185,14 @@ async def bangumi_auth_callback(request: Request, code: str = Query(...), state:
         if avatar_url and avatar_url.startswith("//"):
             avatar_url = "https:" + avatar_url
 
-        auth_to_save = {"bangumiUserId": user_info.get("id"), "nickname": user_info.get("nickname"), "avatarUrl": avatar_url, "accessToken": token_data.get("access_token"), "refreshToken": token_data.get("refresh_token"), "expiresAt": datetime.utcnow() + timedelta(seconds=token_data.get("expires_in", 0))}
+        auth_to_save = {
+            "bangumiUserId": user_info.get("id"),
+            "nickname": user_info.get("nickname"),
+            "avatarUrl": avatar_url,
+            "accessToken": token_data.get("access_token"),
+            "refreshToken": token_data.get("refresh_token"),
+            "expiresAt": get_now() + timedelta(seconds=token_data.get("expires_in", 0)),
+        }
         await _save_bangumi_auth(session, user_id, auth_to_save)
         await session.commit()
         return HTMLResponse("""
@@ -202,6 +211,7 @@ async def bangumi_auth_callback(request: Request, code: str = Query(...), state:
 class BangumiMetadataSource(BaseMetadataSource):
     provider_name = "bangumi"
     api_router = auth_router
+    test_url = "https://bgm.tv"
     
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager, scraper_manager: ScraperManager):
         super().__init__(session_factory, config_manager, scraper_manager)
@@ -364,32 +374,53 @@ class BangumiMetadataSource(BaseMetadataSource):
         # 2. 如果没有Token，检查OAuth是否已配置
         client_id = await self.config_manager.get("bangumiClientId")
         if client_id:
-            return "已配置 OAuth，等待用户授权"
+            # 检查是否有任何用户已通过OAuth授权
+            try:
+                async with self._session_factory() as session:
+                    # 查找所有未过期的授权记录
+                    stmt = select(func.count(orm_models.BangumiAuth.userId)).where(
+                        orm_models.BangumiAuth.expiresAt > get_now()
+                    )
+                    valid_token_count = (await session.execute(stmt)).scalar_one()
+
+                if valid_token_count > 0:
+                    return f"已通过 OAuth 连接 ({valid_token_count} 个用户已授权)"
+                else:
+                    return "已配置 OAuth，等待用户授权"
+            except Exception as e:
+                self.logger.error(f"检查Bangumi OAuth授权状态时出错: {e}")
+                return "OAuth 状态检查失败"
 
         # 3. 如果两者都没有，只检查网络连通性
         proxy_to_use = None
         try:
+            is_using_proxy = False
             async with self._session_factory() as session:
                 proxy_url = await crud.get_config_value(session, "proxy_url", "")
                 proxy_enabled_str = await crud.get_config_value(session, "proxy_enabled", "false")
                 ssl_verify_str = await crud.get_config_value(session, "proxySslVerify", "true")
                 ssl_verify = ssl_verify_str.lower() == 'true'
                 proxy_enabled_globally = proxy_enabled_str.lower() == 'true'
-
+    
                 if proxy_enabled_globally and proxy_url:
                     source_setting = await crud.get_metadata_source_setting_by_name(session, self.provider_name)
                     if source_setting and source_setting.get('useProxy', False):
                         proxy_to_use = proxy_url
+                        is_using_proxy = True
                         self.logger.debug(f"Bangumi: 连接性检查将使用代理: {proxy_to_use}")
+            
             async with httpx.AsyncClient(timeout=10.0, proxy=proxy_to_use, verify=ssl_verify) as client:
                 response = await client.get("https://bgm.tv/")
-                return "连接成功 (未配置认证)" if response.status_code == 200 else f"连接失败 (状态码: {response.status_code})"
+                if response.status_code == 200:
+                    return "通过代理连接成功 (未认证)" if is_using_proxy else "连接成功 (未认证)"
+                else:
+                    return f"通过代理连接失败 (状态码: {response.status_code})" if is_using_proxy else f"连接失败 (状态码: {response.status_code})"
         except httpx.ProxyError as e:
             self.logger.error(f"Bangumi: 连接性检查代理错误: {e}")
             return "连接失败 (代理错误)"
         except Exception as e:
             self.logger.error(f"Bangumi: 连接性检查发生未知错误: {e}", exc_info=True)
-            return "连接失败"
+            return "通过代理连接失败" if is_using_proxy else "连接失败"
 
     async def execute_action(self, action_name: str, payload: Dict[str, Any], user: models.User, request: Request) -> Any:
         if action_name == "get_auth_state":

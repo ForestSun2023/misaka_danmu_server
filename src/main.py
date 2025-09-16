@@ -1,9 +1,11 @@
 import uvicorn
 import asyncio
 import secrets
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Depends, status
 import httpx
+from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi import FastAPI, Request, Depends, status
+from fastapi.openapi.docs import get_swagger_ui_html
 import logging
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse, Response # noqa: F401
@@ -20,7 +22,6 @@ from .webhook_manager import WebhookManager
 from .scheduler import SchedulerManager
 from .config import settings
 from . import crud, security
-from . import migration
 from .log_manager import setup_logging
 from .rate_limiter import RateLimiter
 
@@ -42,9 +43,6 @@ async def lifespan(app: FastAPI):
     await init_db_tables(app)
     session_factory = app.state.db_session_factory
 
-    # 新增：在所有管理器初始化之前，执行数据库迁移
-    await migration.run_db_migration(session_factory)
-
     # 新增：在启动时清理任何未完成的任务
     async with session_factory() as session:
         interrupted_count = await crud.mark_interrupted_tasks_as_failed(session)
@@ -64,7 +62,9 @@ async def lifespan(app: FastAPI):
         # API 和 Webhook
         'customApiDomain': ('', '用于拼接弹幕API地址的自定义域名。'),
         'webhookApiKey': ('', '用于Webhook调用的安全密钥。'),
+        'trustedProxies': ('', '受信任的反向代理IP列表，用逗号分隔。当请求来自这些IP时，将从 X-Forwarded-For 或 X-Real-IP 头中解析真实客户端IP。'),
         'externalApiKey': ('', '用于外部API调用的安全密钥。'),
+        'externalApiDuplicateTaskThresholdHours': (3, '（外部API）重复任务提交阈值（小时）。在此时长内，不允许为同一媒体提交重复的自动导入任务。0为禁用。'),
         'webhookCustomDomain': ('', '用于拼接Webhook URL的自定义域名。'),
         # 认证
         # 代理
@@ -87,11 +87,10 @@ async def lifespan(app: FastAPI):
         'bilibiliCookie': ('', '用于访问B站API的Cookie，特别是buvid3。'),
         'gamerCookie': ('', '用于访问巴哈姆特动画疯的Cookie。'),
         'gamerUserAgent': ('', '用于访问巴哈姆特动画疯的User-Agent。'),
-        "rate_limit_global_limit": ("50", ""),
-        "rate_limit_global_period_seconds": ("3600", ""),
         # 全局过滤
         'search_result_global_blacklist_cn': (r'特典|预告|广告|菜单|花絮|特辑|速看|资讯|彩蛋|直拍|直播回顾|片头|片尾|幕后|映像|番外篇|纪录片|访谈|番外|短片|加更|走心|解忧|纯享|解读|揭秘|赏析', '用于过滤搜索结果标题的全局中文黑名单(正则表达式)。'),
         'search_result_global_blacklist_eng': (r'NC|OP|ED|SP|OVA|OAD|CM|PV|MV|BDMenu|Menu|Bonus|Recap|Teaser|Trailer|Preview|CD|Disc|Scan|Sample|Logo|Info|EDPV|SongSpot|BDSpot', '用于过滤搜索结果标题的全局英文黑名单(正则表达式)。'),
+        'mysqlBinlogRetentionDays': (3, '（仅MySQL）自动清理多少天前的二进制日志（binlog）。0为不清理。需要SUPER或BINLOG_ADMIN权限。'),
     }
     await app.state.config_manager.register_defaults(default_configs)
 
@@ -110,16 +109,15 @@ async def lifespan(app: FastAPI):
     await app.state.metadata_manager.initialize()
 
     # 5. 初始化其他依赖于上述管理器的组件
-    app.state.rate_limiter = RateLimiter(session_factory, app.state.config_manager, app.state.scraper_manager)
+    app.state.rate_limiter = RateLimiter(session_factory, app.state.scraper_manager)
 
     app.include_router(app.state.metadata_manager.router, prefix="/api/metadata")
 
 
 
     app.state.task_manager = TaskManager(session_factory)
-    # 修正：将 ConfigManager 传递给 WebhookManager
     app.state.webhook_manager = WebhookManager(
-        session_factory, app.state.task_manager, app.state.scraper_manager, app.state.config_manager, app.state.rate_limiter, app.state.metadata_manager
+        session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager
     )
     app.state.task_manager.start()
     await create_initial_admin_user(app)
@@ -176,9 +174,22 @@ app = FastAPI(
     description="用于外部自动化和集成的API。所有端点都需要通过 `?api_key=` 进行鉴权。",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/api/control/docs",  # 为外部控制API设置专用的文档路径
+    # 禁用默认的 docs_url，我们将使用自定义的本地化版本
+    docs_url=None,
     redoc_url=None         # 禁用ReDoc
 )
+
+# --- 新增：自定义本地化的 Swagger UI 文档路由 ---
+@app.get("/api/control/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    """提供一个使用本地静态资源的 Swagger UI 页面。"""
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - API Docs",
+        swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-ui/swagger-ui.css",
+        swagger_favicon_url="/static/swagger-ui/favicon-32x32.png"
+    )
 
 # 新增：配置CORS，允许前端开发服务器访问API
 app.add_middleware(
@@ -268,16 +279,22 @@ async def cleanup_task(app: FastAPI):
         except Exception as e:
             logging.getLogger(__name__).error(f"缓存清理任务出错: {e}")
 
+
+
+
+
 # 新增：显式地挂载外部控制API路由，以确保其优先级
 app.include_router(control_router, prefix="/api/control", tags=["External Control API"])
+
+app.include_router(dandan_router, prefix="/api/v1", tags=["DanDanPlay Compatible"], include_in_schema=False)
 
 # 包含所有非 dandanplay 的 API 路由
 app.include_router(api_router, prefix="/api")
 
-
-app.include_router(dandan_router, prefix="/api/v1", tags=["DanDanPlay Compatible"], include_in_schema=False)
-
-
+# --- 新增：挂载 Swagger UI 的静态文件目录 ---
+# 修正：使用绝对路径以确保无论从哪里运行都能找到静态文件目录
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static" / "swagger-ui"
+app.mount("/static/swagger-ui", StaticFiles(directory=STATIC_DIR), name="swagger-ui-static")
 
 # 添加一个运行入口，以便直接从配置启动
 # 这样就可以通过 `python -m src.main` 来运行，并自动使用 config.yml 中的端口和主机

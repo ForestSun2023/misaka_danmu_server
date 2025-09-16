@@ -5,216 +5,107 @@ from fastapi import FastAPI, Request
 from sqlalchemy.engine.url import URL
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, ProgrammingError # Import specific SQLAlchemy exceptions
 from .config import settings
-from .orm_models import Base
-
+from .orm_models import Base # type: ignore
+from .timezone import get_app_timezone, get_timezone_offset_str, get_now
+from .migrations import run_migrations
 # 使用模块级日志记录器
 logger = logging.getLogger(__name__)
 
-async def _migrate_add_anime_year(conn, db_type, db_name):
-    """迁移任务: 确保 anime.year 字段存在，并移除旧的 source_url 字段。"""
-    migration_id = "add_anime_year_and_drop_source_url"
-    logger.info(f"正在检查是否需要执行迁移: {migration_id}...")
-
-    if db_type == "mysql":
-        check_source_url_sql = text(f"SELECT 1 FROM information_schema.columns WHERE table_schema = '{db_name}' AND table_name = 'anime' AND column_name = 'source_url'")
-        check_year_sql = text(f"SELECT 1 FROM information_schema.columns WHERE table_schema = '{db_name}' AND table_name = 'anime' AND column_name = 'year'")
-        add_year_sql = text("ALTER TABLE anime ADD COLUMN `year` INT NULL DEFAULT NULL AFTER `episode_count`")
-        drop_source_url_sql = text("ALTER TABLE anime DROP COLUMN source_url")
-    elif db_type == "postgresql":
-        check_source_url_sql = text("SELECT 1 FROM information_schema.columns WHERE table_name = 'anime' AND column_name = 'source_url'")
-        check_year_sql = text("SELECT 1 FROM information_schema.columns WHERE table_name = 'anime' AND column_name = 'year'")
-        add_year_sql = text('ALTER TABLE anime ADD COLUMN "year" INT NULL')
-        drop_source_url_sql = text("ALTER TABLE anime DROP COLUMN source_url")
-    else:
-        return
-
-    has_source_url = (await conn.execute(check_source_url_sql)).scalar_one_or_none() is not None
-    has_year = (await conn.execute(check_year_sql)).scalar_one_or_none() is not None
-
-    if not has_year:
-        logger.info(f"列 'anime.year' 不存在。正在添加...")
-        await conn.execute(add_year_sql)
-        logger.info(f"成功添加列 'anime.year'。")
-
-    if has_source_url:
-        logger.info(f"发现过时的列 'anime.source_url'。正在删除...")
-        await conn.execute(drop_source_url_sql)
-        logger.info(f"成功删除列 'anime.source_url'。")
-    logger.info(f"迁移任务 '{migration_id}' 检查完成。")
-
-async def _migrate_add_scheduled_task_id(conn, db_type, db_name):
+def _get_db_url(include_db_name: bool = True, for_server: bool = False) -> URL:
     """
-    迁移任务: 确保 task_history.scheduled_task_id 字段存在。
-    """
-    migration_id = "add_scheduled_task_id_to_task_history"
-    logger.info(f"正在检查是否需要执行迁移: {migration_id}...")
-
-    if db_type == "mysql":
-        check_sql = text(f"SELECT 1 FROM information_schema.columns WHERE table_schema = '{db_name}' AND table_name = 'task_history' AND column_name = 'scheduled_task_id'")
-        add_sql = text("ALTER TABLE task_history ADD COLUMN `scheduled_task_id` VARCHAR(100) NULL DEFAULT NULL AFTER `id`, ADD INDEX `ix_task_history_scheduled_task_id` (`scheduled_task_id`)")
-    elif db_type == "postgresql":
-        check_sql = text("SELECT 1 FROM information_schema.columns WHERE table_name = 'task_history' AND column_name = 'scheduled_task_id'")
-        # 修正：将SQL语句拆分为两个，以兼容PostgreSQL
-        add_column_sql = text('ALTER TABLE task_history ADD COLUMN "scheduled_task_id" VARCHAR(100) NULL')
-        create_index_sql = text('CREATE INDEX ix_task_history_scheduled_task_id ON task_history ("scheduled_task_id")')
-    else:
-        return
-
-    column_exists = (await conn.execute(check_sql)).scalar_one_or_none() is not None
-    if not column_exists:
-        logger.info(f"列 'task_history.scheduled_task_id' 不存在。正在添加...")
-        if db_type == "mysql":
-            await conn.execute(add_sql)
-        elif db_type == "postgresql":
-            await conn.execute(add_column_sql)
-            await conn.execute(create_index_sql)
-        logger.info(f"成功添加列 'task_history.scheduled_task_id'。")
-    logger.info(f"迁移任务 '{migration_id}' 检查完成。")
-
-async def _migrate_add_failover_enabled_to_metadata_sources(conn, db_type, db_name):
-    """
-    迁移任务: 确保 metadata_sources.is_failover_enabled 字段存在。
-    """
-    migration_id = "add_failover_enabled_to_metadata_sources"
-    logger.info(f"正在检查是否需要执行迁移: {migration_id}...")
-
-    if db_type == "mysql":
-        check_sql = text(f"SELECT 1 FROM information_schema.columns WHERE table_schema = '{db_name}' AND table_name = 'metadata_sources' AND column_name = 'is_failover_enabled'")
-        add_sql = text("ALTER TABLE metadata_sources ADD COLUMN `is_failover_enabled` BOOLEAN NOT NULL DEFAULT FALSE")
-    elif db_type == "postgresql":
-        check_sql = text("SELECT 1 FROM information_schema.columns WHERE table_name = 'metadata_sources' AND column_name = 'is_failover_enabled'")
-        add_sql = text('ALTER TABLE metadata_sources ADD COLUMN "is_failover_enabled" BOOLEAN NOT NULL DEFAULT FALSE')
-    else:
-        return
-
-    column_exists = (await conn.execute(check_sql)).scalar_one_or_none() is not None
-    if not column_exists:
-        logger.info(f"列 'metadata_sources.is_failover_enabled' 不存在。正在添加...")
-        await conn.execute(add_sql)
-        logger.info(f"成功添加列 'metadata_sources.is_failover_enabled'。")
-    logger.info(f"迁移任务 '{migration_id}' 检查完成。")
-
-async def _migrate_alter_danmaku_file_path_length(conn, db_type, db_name):
-    """迁移任务: 确保 episode.danmaku_file_path 字段有足够的长度。"""
-    migration_id = "alter_danmaku_file_path_length"
-    new_length = 1024
-    logger.info(f"正在检查是否需要执行迁移: {migration_id}...")
-
-    if db_type == "mysql":
-        check_sql = text(f"SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.columns WHERE table_schema = '{db_name}' AND table_name = 'episode' AND column_name = 'danmaku_file_path'")
-        alter_sql = text(f"ALTER TABLE episode MODIFY COLUMN `danmaku_file_path` VARCHAR({new_length})")
-    elif db_type == "postgresql":
-        check_sql = text("SELECT character_maximum_length FROM information_schema.columns WHERE table_name = 'episode' AND column_name = 'danmaku_file_path'")
-        alter_sql = text(f'ALTER TABLE episode ALTER COLUMN "danmaku_file_path" TYPE VARCHAR({new_length})')
-    else:
-        return
-
-    current_length = (await conn.execute(check_sql)).scalar_one_or_none()
-    
-    # 检查列是否存在及其长度是否小于期望值
-    if current_length is not None and current_length < new_length:
-        logger.info(f"列 'episode.danmaku_file_path' 当前长度为 {current_length}，小于目标长度 {new_length}。正在扩展...")
-        await conn.execute(alter_sql)
-        logger.info(f"成功将列 'episode.danmaku_file_path' 扩展到 {new_length}。")
-    else:
-        logger.info(f"列 'episode.danmaku_file_path' 无需扩展。")
-    logger.info(f"迁移任务 '{migration_id}' 检查完成。")
-
-async def _migrate_alter_source_url_to_text(conn, db_type, db_name):
-    """迁移任务: 确保 episode.source_url 字段为 TEXT 类型以支持长 URL。"""
-    migration_id = "alter_source_url_to_text"
-    logger.info(f"正在检查是否需要执行迁移: {migration_id}...")
-
-    if db_type == "mysql":
-        # 对于MySQL, VARCHAR在information_schema中有一个长度，而TEXT类型没有。
-        check_sql = text(f"SELECT DATA_TYPE FROM information_schema.columns WHERE table_schema = '{db_name}' AND table_name = 'episode' AND column_name = 'source_url'")
-        alter_sql = text("ALTER TABLE episode MODIFY COLUMN `source_url` TEXT")
-    elif db_type == "postgresql":
-        check_sql = text("SELECT data_type FROM information_schema.columns WHERE table_name = 'episode' AND column_name = 'source_url'")
-        alter_sql = text('ALTER TABLE episode ALTER COLUMN "source_url" TYPE TEXT')
-    else:
-        return
-
-    result = await conn.execute(check_sql)
-    current_type = result.scalar_one_or_none()
-    
-    # 如果列存在且其类型不是某种形式的TEXT，则进行修改。
-    if current_type and 'text' not in current_type.lower():
-        logger.info(f"列 'episode.source_url' 当前类型为 {current_type}，正在修改为 TEXT...")
-        await conn.execute(alter_sql)
-        logger.info(f"成功将列 'episode.source_url' 修改为 TEXT。")
-    else:
-        logger.info(f"列 'episode.source_url' 无需修改。")
-    logger.info(f"迁移任务 '{migration_id}' 检查完成。")
-
-async def _run_migrations(conn):
-    """
-    执行所有一次性的数据库架构迁移。
+    根据配置生成数据库连接URL。
+    :param include_db_name: URL中是否包含数据库名称。
+    :param for_server: 是否为连接到服务器（而不是特定数据库）生成URL，主要用于PostgreSQL。
     """
     db_type = settings.database.type.lower()
-    db_name = settings.database.name
+    
+    if db_type == "mysql":
+        drivername = "mysql+aiomysql"
+        query = {"charset": "utf8mb4"}
+        database = settings.database.name if include_db_name else None
+    elif db_type == "postgresql":
+        drivername = "postgresql+asyncpg"
+        # 修正：移除在连接URL中设置时区的逻辑。
+        # 这确保了应用与数据库的交互在时间处理上是“时区无关”的，
+        # 避免了因驱动程序自动转换时区而导致的数据不一致问题。
+        query = None # 确保不通过查询参数传递时区
+        if for_server:
+            database = "postgres"
+        else:
+            database = settings.database.name if include_db_name else None
+    else:
+        raise ValueError(f"不支持的数据库类型: '{db_type}'。请使用 'mysql' 或 'postgresql'。")
 
-    if db_type not in ["mysql", "postgresql"]:
-        logger.warning(f"不支持为数据库类型 '{db_type}' 自动执行迁移。")
-        return
-
-    await _migrate_add_anime_year(conn, db_type, db_name)
-    await _migrate_add_scheduled_task_id(conn, db_type, db_name)
-    await _migrate_add_failover_enabled_to_metadata_sources(conn, db_type, db_name)
-    await _migrate_alter_danmaku_file_path_length(conn, db_type, db_name)
-    await _migrate_alter_source_url_to_text(conn, db_type, db_name)
+    return URL.create(
+        drivername=drivername, username=settings.database.user, password=settings.database.password,
+        host=settings.database.host, port=settings.database.port, database=database, query=query,
+    )
 
 def _log_db_connection_error(context_message: str, e: Exception):
-    """Logs a standardized, detailed error message for database connection failures."""
+    """
+    Logs a standardized, detailed error message for database connection failures,
+    attempting to diagnose specific issues like connection refused or permission denied.
+    """
     logger.error("="*60)
     logger.error(f"=== {context_message}失败，应用无法启动。 ===")
     logger.error(f"=== 错误类型: {type(e).__name__}")
     logger.error(f"=== 错误详情: {e}")
     logger.error("---")
-    logger.error("--- 可能的原因与排查建议: ---")
-    logger.error("--- 1. 数据库服务未运行: 请确认您的数据库服务正在运行。")
-    logger.error(f"--- 2. 配置错误: 请检查您的配置文件或环境变量中的数据库连接信息是否正确。")
-    logger.error(f"---    - 主机 (Host): {settings.database.host}")
-    logger.error(f"---    - 端口 (Port): {settings.database.port}")
-    logger.error(f"---    - 用户 (User): {settings.database.user}")
-    logger.error("--- 3. 网络问题: 如果应用和数据库在不同的容器或机器上，请检查它们之间的网络连接和防火墙设置。")
-    logger.error("--- 4. 权限问题: 确认提供的用户有权限从应用所在的IP地址连接，并有创建数据库的权限。")
+    logger.error("--- 诊断与排查建议: ---")
+
+    # Attempt to provide more specific diagnostics based on the exception type
+    specific_diagnosis = ""
+    if isinstance(e, OperationalError):
+        # For MySQL (pymysql) errors, e.orig often has an errno
+        if hasattr(e.orig, 'errno'):
+            if e.orig.errno == 2003:
+                specific_diagnosis = "无法连接到数据库服务器。请检查主机和端口配置，以及网络防火墙。"
+            elif e.orig.errno == 1044:
+                specific_diagnosis = f"数据库用户 '{settings.database.user}' 权限不足，无法创建或访问数据库 '{settings.database.name}'。"
+            elif e.orig.errno == 1045:
+                specific_diagnosis = f"数据库用户 '{settings.database.user}' 的密码错误。"
+            else:
+                specific_diagnosis = f"数据库操作错误 (MySQL 错误码: {e.orig.errno})。"
+        # For PostgreSQL (asyncpg) errors, check the original exception type/message
+        elif isinstance(e.orig, Exception):
+            err_str = str(e.orig).lower()
+            if "connection refused" in err_str or "could not connect" in err_str:
+                specific_diagnosis = "无法连接到数据库服务器。请检查主机和端口配置，以及网络防火墙。"
+            elif "permission denied" in err_str or "privilege" in err_str:
+                specific_diagnosis = f"数据库用户 '{settings.database.user}' 权限不足。"
+            elif "password authentication failed" in err_str:
+                specific_diagnosis = f"数据库用户 '{settings.database.user}' 的密码错误。"
+    elif isinstance(e, ProgrammingError):
+        specific_diagnosis = "数据库编程错误，可能是SQL语法或权限问题。"
+
+    if specific_diagnosis:
+        logger.error(f"--- [!] 精确诊断: {specific_diagnosis}")
+        logger.error("---")
+
+    logger.error("--- 通用检查列表: ---")
+    logger.error("--- 1. 数据库服务是否正在运行？")
+    logger.error(f"--- 2. 数据库配置是否正确？ (主机: {settings.database.host}, 端口: {settings.database.port}, 用户: {settings.database.user})")
+    logger.error("--- 3. 数据库密码是否正确？")
+    logger.error("--- 4. 数据库用户是否有足够的权限？")
+    logger.error("--- 5. 应用与数据库之间的网络是否通畅？")
     logger.error("="*60)
 
 async def create_db_engine_and_session(app: FastAPI):
     """创建数据库引擎和会话工厂，并存储在 app.state 中"""
-    db_type = settings.database.type.lower()
-    if db_type == "mysql":
-        db_url = URL.create(
-            drivername="mysql+aiomysql",
-            username=settings.database.user,
-            password=settings.database.password,
-            host=settings.database.host,
-            port=settings.database.port,
-            database=settings.database.name,
-            query={"charset": "utf8mb4"},
-        )
-    elif db_type == "postgresql":
-        db_url = URL.create(
-            drivername="postgresql+asyncpg",
-            username=settings.database.user,
-            password=settings.database.password,
-            host=settings.database.host,
-            port=settings.database.port,
-            database=settings.database.name,
-        )
-    else:
-        raise ValueError(f"不支持的数据库类型: '{db_type}'。请使用 'mysql' 或 'postgresql'。")
     try:
-        engine = create_async_engine(
-            db_url,
-            echo=False,
-            pool_recycle=3600,
-            pool_size=10,
-            max_overflow=20,
-            pool_timeout=30
-        )
+        db_url = _get_db_url()
+        db_type = settings.database.type.lower()
+        engine_args = {
+            "echo": False,
+            "pool_recycle": 3600,
+            "pool_size": 10,
+            "max_overflow": 20,
+            "pool_timeout": 30
+        }
+
+        engine = create_async_engine(db_url, **engine_args)
         app.state.db_engine = engine
         app.state.db_session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         logger.info("数据库引擎和会话工厂创建成功。")
@@ -229,27 +120,12 @@ async def _create_db_if_not_exists():
     db_name = settings.database.name
 
     if db_type == "mysql":
-        # 创建一个不带数据库名称的连接URL
-        server_url = URL.create(
-            drivername="mysql+aiomysql",
-            username=settings.database.user,
-            password=settings.database.password,
-            host=settings.database.host,
-            port=settings.database.port,
-            query={"charset": "utf8mb4"},
-        )
+        server_url = _get_db_url(include_db_name=False)
         check_sql = text(f"SHOW DATABASES LIKE '{db_name}'")
         create_sql = text(f"CREATE DATABASE `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
     elif db_type == "postgresql":
         # 对于PostgreSQL，连接到默认的 'postgres' 数据库来执行创建操作
-        server_url = URL.create(
-            drivername="postgresql+asyncpg",
-            username=settings.database.user,
-            password=settings.database.password,
-            host=settings.database.host,
-            port=settings.database.port,
-            database="postgres",
-        )
+        server_url = _get_db_url(for_server=True)
         check_sql = text(f"SELECT 1 FROM pg_database WHERE datname = '{db_name}'")
         create_sql = text(f'CREATE DATABASE "{db_name}"')
     else:
@@ -257,8 +133,12 @@ async def _create_db_if_not_exists():
         return
 
     # 设置隔离级别以允许 DDL 语句
-    engine = create_async_engine(server_url, echo=False, isolation_level="AUTOCOMMIT")
-    
+    engine_args = {
+        "echo": False,
+        "isolation_level": "AUTOCOMMIT"
+    }
+
+    engine = create_async_engine(server_url, **engine_args)
     try:
         async with engine.connect() as conn:
             # 检查数据库是否存在
@@ -343,6 +223,6 @@ async def init_db_tables(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
         logger.info("数据库模型同步完成。")
 
-        # 2. 然后，在已存在的表结构上运行手动迁移。
-        await _run_migrations(conn)
+        # 2. 然后，在已存在的表结构上运行统一的迁移任务。
+        await run_migrations(conn, settings.database.type.lower(), settings.database.name)
     logger.info("数据库初始化完成。")

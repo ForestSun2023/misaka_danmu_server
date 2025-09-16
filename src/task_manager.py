@@ -3,7 +3,7 @@ import logging
 import traceback
 from enum import Enum
 import time
-from typing import Any, Callable, Coroutine, Dict, List, Tuple, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Tuple, Optional # Add HTTPException, status
 from uuid import uuid4, UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from . import models, crud
 
 logger = logging.getLogger(__name__)
+from fastapi import HTTPException, status
 
 class TaskStatus(str, Enum):
     PENDING = "排队中"
@@ -54,6 +55,61 @@ class TaskManager:
             self._worker_task = asyncio.create_task(self._worker())
             self.logger.info("任务管理器已启动。")
 
+    async def _run_task_wrapper(self, task: Task):
+        """
+        一个独立的包装器，用于在后台安全地执行单个任务。
+        这可以防止单个任务的失败或阻塞影响到整个任务管理器。
+        """
+        self.logger.info(f"开始执行任务 '{task.title}' (ID: {task.task_id})")
+        try:
+            # This task is now running, remove it from pending titles
+            # This is now the single point of responsibility for this cleanup.
+            async with self._lock:
+                self._pending_titles.discard(task.title)
+                
+            async with self._session_factory() as session:
+                await crud.update_task_progress_in_history(
+                    session, task.task_id, TaskStatus.RUNNING, 0, "正在初始化..."
+                )
+                progress_callback = self._get_progress_callback(task)
+                actual_coroutine = task.coro_factory(session, progress_callback)
+
+                running_task = asyncio.create_task(actual_coroutine)
+                task.running_coro_task = running_task
+                await running_task
+
+                await crud.finalize_task_in_history(
+                    session, task.task_id, TaskStatus.COMPLETED, "任务成功完成"
+                )
+                self.logger.info(f"任务 '{task.title}' (ID: {task.task_id}) 已成功完成。")
+        except TaskSuccess as e:
+            final_message = str(e) if str(e) else "任务成功完成"
+            async with self._session_factory() as final_session:
+                await crud.finalize_task_in_history(
+                    final_session, task.task_id, TaskStatus.COMPLETED, final_message
+                )
+            self.logger.info(f"任务 '{task.title}' (ID: {task.task_id}) 已成功完成，消息: {final_message}")
+        except asyncio.CancelledError:
+            self.logger.info(f"任务 '{task.title}' (ID: {task.task_id}) 已被用户取消。")
+            async with self._session_factory() as final_session:
+                await crud.finalize_task_in_history(
+                    final_session, task.task_id, TaskStatus.FAILED, "任务已被用户取消"
+                )
+        except Exception:
+            error_message = f"任务执行失败 - {traceback.format_exc()}"
+            async with self._session_factory() as final_session:
+                await crud.finalize_task_in_history(
+                    final_session, task.task_id, TaskStatus.FAILED, error_message.splitlines()[-1]
+                )
+            self.logger.error(f"任务 '{task.title}' (ID: {task.task_id}) 执行失败: {traceback.format_exc()}")
+        finally:
+            async with self._lock:
+                if task.unique_key:
+                    self._active_unique_keys.discard(task.unique_key)
+                # Also remove from pending_titles again just in case of race conditions.
+                self._pending_titles.discard(task.title)
+            task.done_event.set()
+
     async def stop(self):
         """停止任务管理器。"""
         if self._worker_task:
@@ -68,81 +124,44 @@ class TaskManager:
     async def _worker(self):
         """从队列中获取并执行任务。"""
         while True:
-            self._current_task = None # 清理上一个任务
             task: Task = await self._queue.get()
-            # 从待处理集合中移除
-            async with self._lock:
-                self._pending_titles.discard(task.title)
-            self._current_task = task
-            self.logger.info(f"开始执行任务 '{task.title}' (ID: {task.task_id})")
-
             try:
-                async with self._session_factory() as session:
-                    await crud.update_task_progress_in_history(
-                        session, task.task_id, TaskStatus.RUNNING, 0, "正在初始化..."
-                    )
-                    progress_callback = self._get_progress_callback(task)
-                    actual_coroutine = task.coro_factory(session, progress_callback)
-
-                    # 将协程包装在Task中，以便可以取消它
-                    running_task = asyncio.create_task(actual_coroutine)
-                    task.running_coro_task = running_task
-                    await running_task
-
-                    # 对于没有引发 TaskSuccess 异常而正常结束的任务，使用通用成功消息
-                    await crud.finalize_task_in_history(
-                        session, task.task_id, TaskStatus.COMPLETED, "任务成功完成"
-                    )
-                    self.logger.info(f"任务 '{task.title}' (ID: {task.task_id}) 已成功完成。")
-            except TaskSuccess as e:
-                # 捕获 TaskSuccess 异常，使用其消息作为最终描述
-                final_message = str(e) if str(e) else "任务成功完成"
-                async with self._session_factory() as final_session:
-                    await crud.finalize_task_in_history(
-                        final_session, task.task_id, TaskStatus.COMPLETED, final_message
-                    )
-                self.logger.info(f"任务 '{task.title}' (ID: {task.task_id}) 已成功完成，消息: {final_message}")
-            except asyncio.CancelledError:
-                # 当任务被中止时，会捕获此异常
-                self.logger.info(f"任务 '{task.title}' (ID: {task.task_id}) 已被用户取消。")
-                async with self._session_factory() as final_session:
-                    await crud.finalize_task_in_history(
-                        final_session, task.task_id, TaskStatus.FAILED, "任务已被用户取消"
-                    )
-            except Exception as e:
-                error_message = f"任务执行失败 - {e}"
-                async with self._session_factory() as final_session:
-                    await crud.finalize_task_in_history(
-                        final_session, task.task_id, TaskStatus.FAILED, error_message
-                    )
-                self.logger.error(f"任务 '{task.title}' (ID: {task.task_id}) 执行失败: {traceback.format_exc()}")
+                self._current_task = task
+                # The wrapper now handles removing the title from the pending set.
+                await self._run_task_wrapper(task)
             finally:
-                # 任务完成后，从活动键集合中移除其唯一键
-                async with self._lock:
-                    if task.unique_key:
-                        self._active_unique_keys.discard(task.unique_key)
+                self._current_task = None
                 self._queue.task_done()
-                task.done_event.set()
 
     async def submit_task(
         self,
         coro_factory: Callable[[AsyncSession, Callable], Coroutine],
         title: str,
         scheduled_task_id: Optional[str] = None,
-        unique_key: Optional[str] = None
+        unique_key: Optional[str] = None,
+        run_immediately: bool = False
     ) -> Tuple[str, asyncio.Event]:
         """提交一个新任务到队列，并在数据库中创建记录。返回任务ID和完成事件。"""
         async with self._lock:
             # 检查是否有同名任务正在排队或运行
             if title in self._pending_titles:
-                raise ValueError(f"任务 '{title}' 已在队列中，请勿重复提交。")
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"任务 '{title}' 已在队列中，请勿重复提交。"
+                )
             if self._current_task and self._current_task.title == title:
-                raise ValueError(f"任务 '{title}' 已在运行中，请勿重复提交。")
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"任务 '{title}' 已在运行中，请勿重复提交。"
+                )
             
             # 新增：检查唯一键，防止同一资源的多个任务同时进行
             if unique_key:
                 if unique_key in self._active_unique_keys:
-                    raise ValueError(f"一个针对此媒体的导入任务已在队列中或正在运行，请勿重复提交。")
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"一个针对此媒体的相似任务已在队列中或正在运行，请勿重复提交。"
+                    )
                 self._active_unique_keys.add(unique_key)
             self._pending_titles.add(title)
 
@@ -154,19 +173,23 @@ class TaskManager:
                 session, task_id, title, TaskStatus.PENDING, "等待执行...", scheduled_task_id=scheduled_task_id
             )
         
-        await self._queue.put(task)
-        self.logger.info(f"任务 '{title}' 已提交，ID: {task_id}")
+        if run_immediately:
+            self.logger.info(f"立即执行任务 '{title}' (ID: {task_id})，绕过主队列。")
+            asyncio.create_task(self._run_task_wrapper(task))
+        else:
+            await self._queue.put(task)
+            self.logger.info(f"任务 '{title}' 已提交到队列，ID: {task_id}")
         return task_id, task.done_event
 
     def _get_progress_callback(self, task: Task) -> Callable:
-        """为特定任务创建一个可暂停且带节流的回调闭包。"""
+        """为特定任务创建一个可暂停的回调闭包。"""
         async def pausable_callback(progress: int, description: str, status: Optional[TaskStatus] = None):
             # 核心暂停逻辑：在每次更新进度前，检查暂停事件。
             # 如果事件被清除 (cleared)，.wait() 将会阻塞，直到事件被重新设置 (set)。
             await task.pause_event.wait()
 
             now = time.time()
-            # 节流逻辑：只在状态改变、首次、完成或距离上次更新超过0.5秒时才更新数据库
+            # 只在状态改变、首次、完成或距离上次更新超过0.5秒时才更新数据库
             is_status_change = status is not None
             force_update = progress == 0 or progress >= 100 or is_status_change
             
@@ -176,7 +199,7 @@ class TaskManager:
                     return
                 task.last_update_time = now
 
-            # 数据库更新现在是同步的（在回调的协程内），但由于节流，它不会频繁发生。
+            # 数据库更新现在是同步的（在回调的协程内），但由于此逻辑，它不会频繁发生。
             # 这避免了创建大量并发任务，从而保护了数据库连接池。
             try:
                 async with self._session_factory() as session:
@@ -194,22 +217,33 @@ class TaskManager:
         注意：此操作不是线程安全的，但对于单工作线程模型是可接受的。
         """
         found_and_removed = False
+        task_to_remove: Optional[Task] = None
         temp_list = []
         while not self._queue.empty():
             try:
                 task = self._queue.get_nowait()
                 if task.task_id == task_id:
                     found_and_removed = True
+                    task_to_remove = task
                     task.done_event.set()
                     self.logger.info(f"已从队列中取消待处理任务 '{task.title}' (ID: {task_id})。")
                 else:
                     temp_list.append(task)
             except asyncio.QueueEmpty:
                 break
-        
+
         for task in temp_list:
             await self._queue.put(task)
-            
+
+        # 修正：如果一个待处理任务被取消，必须同时清理其在管理器中的状态（任务标题和唯一键），
+        # 以允许用户重新提交该任务。
+        if found_and_removed and task_to_remove:
+            async with self._lock:
+                self._pending_titles.discard(task_to_remove.title)
+                if task_to_remove.unique_key:
+                    self._active_unique_keys.discard(task_to_remove.unique_key)
+                    self.logger.info(f"已为已取消的待处理任务释放唯一键: {task_to_remove.unique_key}")
+
         return found_and_removed
 
     async def abort_current_task(self, task_id: str) -> bool:

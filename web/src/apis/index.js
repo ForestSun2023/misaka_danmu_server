@@ -151,10 +151,10 @@ export const getRateLimitStatus = () => api.get('/api/ui/rate-limit/status')
 export const getTokenList = () => api.get('/api/ui/tokens')
 /** 增加token */
 export const addToken = data => api.post('/api/ui/tokens', data)
-/** 获取ua配置 */
-export const getUaMode = () => api.get('/api/ui/config/ua_filter_mode')
-/** 获取ua配置 */
-export const setUaMode = data => api.put('/api/ui/config/ua_filter_mode', data)
+/** 获取UA过滤模式 */
+export const getUaMode = () => api.get('/api/ui/config/uaFilterMode')
+/** 设置UA过滤模式 */
+export const setUaMode = data => api.put('/api/ui/config/uaFilterMode', data)
 /** 获取自定义域名 */
 export const getCustomDomain = () => api.get('/api/ui/config/custom_api_domain')
 /** 设置自定义域名 */
@@ -168,6 +168,11 @@ export const toggleTokenStatus = data =>
   api.put(`api/ui/tokens/${data.tokenId}/toggle`)
 /** 删除token */
 export const deleteToken = data => api.delete(`/api/ui/tokens/${data.tokenId}`)
+/** 编辑token */
+export const editToken = data => api.put(`/api/ui/tokens/${data.id}`, data)
+/** 重置token调用次数 */
+export const resetTokenCounter = data =>
+  api.post(`/api/ui/tokens/${data.id}/reset`)
 /** 获取ua规则 */
 export const getUaRules = () => api.get('/api/ui/ua-rules')
 /** 添加ua规则 */
@@ -241,6 +246,15 @@ export const getProxyConfig = () => api.get('/api/ui/config/proxy')
 /** 设置代理配置 */
 export const setProxyConfig = data => api.put('/api/ui/config/proxy', data)
 
+/** 测试代理连接 */
+export const testProxy = data => api.post('/api/ui/proxy/test', data)
+
+/** 获取受信任的反向代理IP */
+export const getTrustedProxiesConfig = () =>
+  api.get('/api/ui/config/trustedProxies')
+/** 设置受信任的反向代理IP */
+export const setTrustedProxiesConfig = data =>
+  api.put('/api/ui/config/trustedProxies', data)
 /** ---------------------------------------------- 搜索源配置----------------------------------------------  */
 /** 获取刮削器配置 */
 export const getScrapers = () => api.get('/api/ui/scrapers')
@@ -280,8 +294,8 @@ export const biliLogout = () =>
   api.post('/api/ui/scrapers/bilibili/actions/logout')
 
 /** ----------------------------------------------弹幕库----------------------------------------------  */
-/** 弹幕库列表 */
-export const getAnimeLibrary = () => api.get('/api/ui/library')
+/** 弹幕库列表 (支持搜索和分页) */
+export const getAnimeLibrary = data => api.get('/api/ui/library', data)
 /** 删除单个资源 */
 export const deleteAnime = data =>
   api.delete(`/api/ui/library/anime/${data.animeId}`)
@@ -339,8 +353,12 @@ export const fullSourceUpdate = data =>
   api.post(`/api/ui/library/source/${data.sourceId}/refresh?mode=full`)
 
 /** 获取分集 */
-export const getEpisodes = data =>
-  api.get(`/api/ui/library/source/${data.sourceId}/episodes`)
+export const getEpisodes = data => {
+  return api.get(`/api/ui/library/source/${data.sourceId}/episodes`, {
+    page: data.page,
+    pageSize: data.pageSize,
+  })
+}
 
 /** 编辑分集信息 */
 export const editEpisode = data =>
@@ -365,8 +383,16 @@ export const deleteAnimeEpisodeSingle = data =>
 export const resetEpisode = data =>
   api.post(`/api/ui/library/source/${data.sourceId}/reorder-episodes`)
 
+/** 集数偏移 */
+export const offsetEpisodes = data =>
+  api.post('/api/ui/library/episodes/offset', data)
+
 /** 获取弹幕详情 */
-export const getDanmakuDetail = data => api.get(`/api/ui/comment/${data.id}`)
+export const getDanmakuDetail = data =>
+  api.get(`/api/ui/comment/${data.id}`, {
+    page: data.page,
+    pageSize: data.pageSize,
+  })
 
 /** 刷新海报 */
 export const refreshPoster = data =>

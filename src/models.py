@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Search 模块模型
 class AnimeInfo(BaseModel):
@@ -189,6 +189,7 @@ class MetadataSourceSettingUpdate(BaseModel):
     providerName: str
     isAuxSearchEnabled: bool
     useProxy: bool
+    isFailoverEnabled: bool
     displayOrder: int
 
 
@@ -207,7 +208,8 @@ class LibraryAnimeInfo(BaseModel):
     createdAt: datetime
 
 class LibraryResponse(BaseModel):
-    animes: List[LibraryAnimeInfo]
+    total: int
+    list: List[LibraryAnimeInfo]
 
 # --- 分集管理模型 ---
 class EpisodeDetail(BaseModel):
@@ -218,6 +220,11 @@ class EpisodeDetail(BaseModel):
     fetchedAt: Optional[datetime] = None
     commentCount: int
 
+class PaginatedEpisodesResponse(BaseModel):
+    """用于分集列表分页的响应模型"""
+    total: int
+    list: List[EpisodeDetail]
+
 # --- 任务管理器模型 ---
 class TaskInfo(BaseModel):
     taskId: str
@@ -227,6 +234,11 @@ class TaskInfo(BaseModel):
     description: str
     createdAt: datetime
 
+class PaginatedTasksResponse(BaseModel):
+    """用于任务列表分页的响应模型"""
+    total: int
+    list: List[TaskInfo]
+
 # --- API Token 管理模型 ---
 class ApiTokenInfo(BaseModel):
     id: int
@@ -235,10 +247,13 @@ class ApiTokenInfo(BaseModel):
     isEnabled: bool
     expiresAt: Optional[datetime] = None
     createdAt: datetime
+    dailyCallLimit: int
+    dailyCallCount: int
 
 class ApiTokenCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=50, description="Token的描述性名称")
     validityPeriod: str = Field("permanent", description="有效期: permanent, 1d, 7d, 30d, 180d, 365d")
+    dailyCallLimit: int = Field(500, description="每日调用次数限制, -1 表示无限")
 
 # --- UA Filter Models ---
 class UaRule(BaseModel):
@@ -277,6 +292,11 @@ class PasswordChange(BaseModel):
     oldPassword: str = Field(..., description="当前密码")
     newPassword: str = Field(..., min_length=8, description="新密码 (至少8位)")
 
+class PaginatedCommentResponse(BaseModel):
+    """用于UI弹幕列表分页的响应模型"""
+    total: int
+    list: List[Comment]
+
 class BangumiAuthStatus(BaseModel):
     isAuthenticated: bool
     nickname: Optional[str] = None
@@ -305,6 +325,20 @@ class EditedImportRequest(BaseModel):
 class ControlUrlImportRequest(BaseModel):
     url: str
     provider: str
+
+class ManualImportRequest(BaseModel):
+    """用于手动导入单个分集的请求体模型"""
+    title: Optional[str] = None
+    episodeIndex: int
+    # 使用别名 'sourceUrl' 来兼容前端发送的字段
+    url: Optional[str] = Field(None, alias='sourceUrl')
+    content: Optional[str] = None
+
+    @model_validator(mode='after')
+    def check_url_or_content(self) -> "ManualImportRequest":
+        if not self.url and not self.content:
+            raise ValueError('必须提供 "url" 或 "content" 字段。')
+        return self
 
 class DanmakuOutputSettings(BaseModel):
     limit_per_source: int
@@ -340,6 +374,7 @@ class MetadataSourceStatusResponse(BaseModel):
     displayOrder: int
     status: str
     useProxy: bool
+    isFailoverEnabled: bool
 
 class ScraperSettingWithConfig(ScraperSetting):
     configurableFields: Optional[Dict[str, str]] = None
@@ -352,10 +387,14 @@ class ProxySettingsResponse(BaseModel):
     proxyPort: Optional[int] = None
     proxyUsername: Optional[str] = None
     proxyPassword: Optional[str] = None
-    proxyEnabled: bool
+    proxyEnabled: bool = False
 
 class ReassociationRequest(BaseModel):
     targetAnimeId: int
+
+class EpisodeOffsetRequest(BaseModel):
+    episodeIds: List[int]
+    offset: int
 
 class BulkDeleteEpisodesRequest(BaseModel):
     episodeIds: List[int]
@@ -386,10 +425,11 @@ class AvailableJobInfo(BaseModel):
 class ProxySettingsUpdate(BaseModel):
     proxyProtocol: str
     proxyHost: Optional[str] = None
-    proxyPort: Optional[int] = None
+    proxyPort: Optional[Union[int, str]] = None
     proxyUsername: Optional[str] = None
     proxyPassword: Optional[str] = None
     proxyEnabled: bool
+    proxySslVerify: bool = Field(True, description="是否验证代理服务器的SSL证书")
 
 class UaRuleCreate(BaseModel):
     uaString: str
@@ -444,7 +484,7 @@ class EnrichedTMDBEpisodeGroupDetails(TMDBEpisodeGroupDetails):
 
 
 class BatchManualImportItem(BaseModel):
-    episodeTitle: Optional[str] = Field(None, description="分集标题 (可选)")
+    title: Optional[str] = Field(None, description="分集标题 (可选)")
     episodeIndex: int = Field(..., gt=0, description="集数")
     content: str = Field(..., description="URL或XML文件内容")
 
@@ -472,4 +512,18 @@ class RateLimitStatusResponse(BaseModel):
     globalEnabled: bool
     providers: List[RateLimitStatusItem]
 
-# --- Rate Limiter Models ---
+
+class ControlRateLimitProviderStatus(BaseModel):
+    """用于外部API的单个流控规则状态"""
+    providerName: str
+    requestCount: int
+    quota: Union[int, str]
+
+class ControlRateLimitStatusResponse(BaseModel):
+    """用于外部API的流控状态响应模型"""
+    globalEnabled: bool
+    globalRequestCount: int
+    globalLimit: int
+    globalPeriod: str
+    secondsUntilReset: int
+    providers: List[ControlRateLimitProviderStatus]

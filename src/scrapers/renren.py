@@ -204,13 +204,28 @@ class RenrenScraper(BaseScraper):
     provider_name = "renren"
     handled_domains = ["www.rrsp.com.cn"]
     referer = "https://rrsp.com.cn/"
+    test_url = "https://api.rrmj.plus"
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager):
         super().__init__(session_factory, config_manager)
-        self.client = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
         self._api_lock = asyncio.Lock()
         self._last_request_time = 0.0
         self._min_interval = 0.4
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def _ensure_client(self) -> httpx.AsyncClient:
+        """Ensures the httpx client is initialized, with proxy support."""
+        # 检查代理配置是否发生变化
+        new_proxy_config = await self._get_proxy_for_provider()
+        if self.client and new_proxy_config != self._current_proxy_config:
+            self.logger.info("Renren: 代理配置已更改，正在重建HTTP客户端...")
+            await self.client.aclose()
+            self.client = None
+
+        if self.client is None:
+            self.client = await self._create_client()
+        
+        return self.client
 
     def _generate_device_id(self) -> str:
         """Generate a fresh device/session id for each request.
@@ -221,13 +236,16 @@ class RenrenScraper(BaseScraper):
         return str(uuid.uuid4()).upper()
 
     async def close(self):
-        await self.client.aclose()
+        if self.client:
+            await self.client.aclose()
+            self.client = None
 
     async def _request(self, method: str, url: str, *, params: Optional[Dict[str, Any]] = None) -> httpx.Response:
         # This method is now a simple wrapper, the rate limiting and signing is handled in _perform_network_search
         device_id = self._generate_device_id()
         headers = build_signed_headers(method=method, url=url, params=params or {}, device_id=device_id)
-        resp = await self.client.request(method, url, params=params, headers=headers)
+        client = await self._ensure_client()
+        resp = await client.request(method, url, params=params, headers=headers)
         if await self._should_log_responses():
             scraper_responses_logger.debug(f"Renren Response ({method} {url}): status={resp.status_code}, text={resp.text}")
         return resp
@@ -304,6 +322,9 @@ class RenrenScraper(BaseScraper):
                     episodeCount=episode_count,
                     currentEpisodeIndex=episode_info.get("episode") if episode_info else None,
                 ))
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            # 修正：对常见的网络错误只记录警告，避免在日志中产生大量堆栈跟踪。
+            self.logger.warning(f"renren: 网络搜索 '{keyword}' 时连接超时或网络错误: {e}")
         except Exception as e:
             self.logger.error(f"renren: 网络搜索 '{keyword}' 失败: {e}", exc_info=True)
 
@@ -428,11 +449,26 @@ class RenrenScraper(BaseScraper):
                 raw_episodes.append(ep)
 
         # 统一过滤逻辑
-        blacklist_pattern = await self.get_episode_blacklist_pattern()
-        if blacklist_pattern:
-            original_count = len(raw_episodes)
-            raw_episodes = [ep for ep in raw_episodes if not blacklist_pattern.search(str(ep.get("title", "")))]
-            self.logger.info(f"Renren: 根据黑名单规则过滤掉了 {original_count - len(raw_episodes)} 个分集。")
+        # 修正：安全地获取并组合黑名单规则
+        # 修正：Renren源只应使用其专属的黑名单，以避免全局规则误杀。
+        provider_pattern_str = await self.config_manager.get(f"{self.provider_name}_episode_blacklist_regex", self._PROVIDER_SPECIFIC_BLACKLIST_DEFAULT)
+        blacklist_rules = [provider_pattern_str] if provider_pattern_str else []
+
+        if blacklist_rules:
+            filtered_episodes = []
+            filtered_out_log: Dict[str, List[str]] = defaultdict(list)
+
+            for ep in raw_episodes:
+                title_to_check = str(ep.get("title", ""))
+                match_rule = next((rule for rule in blacklist_rules if rule and re.search(rule, title_to_check, re.IGNORECASE)), None)
+                if not match_rule:
+                    filtered_episodes.append(ep)
+                else:
+                    filtered_out_log[match_rule].append(title_to_check)
+            
+            for rule, titles in filtered_out_log.items():
+                self.logger.info(f"Renren: 根据黑名单规则 '{rule}' 过滤掉了 {len(titles)} 个分集: {', '.join(titles)}")
+            raw_episodes = filtered_episodes
 
         # 过滤后再编号
         provider_eps = []
@@ -461,11 +497,12 @@ class RenrenScraper(BaseScraper):
                 "Origin": prof.origin,
                 "Referer": prof.referer,
             }
-            resp = await self.client.get(url, timeout=20.0, headers=headers)
-            if await self._should_log_responses():
-                scraper_responses_logger.debug(f"Renren Danmaku Response (sid={sid}): status={resp.status_code}, text={resp.text}") 
-            resp.raise_for_status()
-            data = auto_decode(resp.text)
+            async with await self._create_client() as client:
+                resp = await client.get(url, timeout=20.0, headers=headers)
+                if await self._should_log_responses():
+                    scraper_responses_logger.debug(f"Renren Danmaku Response (sid={sid}): status={resp.status_code}, text={resp.text}") 
+                resp.raise_for_status()
+                data = auto_decode(resp.text)
             if isinstance(data, list):
                 return data
             if isinstance(data, dict) and isinstance(data.get("data"), list):
@@ -539,7 +576,7 @@ class RenrenScraper(BaseScraper):
             timestamp = float(c["timestamp"]) if isinstance(c["timestamp"], (int, float)) else 0.0
             color = int(c["color"]) if isinstance(c["color"], int) else 16777215
             mode = int(c["mode"]) if isinstance(c["mode"], int) else 1
-            p_string = f"{timestamp:.2f},{mode},{color},[{self.provider_name}]"
+            p_string = f"{timestamp:.2f},{mode},25,{color},[{self.provider_name}]"
             out.append({
                 "cid": c["content_id"],
                 "p": p_string,

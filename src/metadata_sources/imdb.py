@@ -34,6 +34,7 @@ class ImdbApiResponse(BaseModel):
 
 class ImdbMetadataSource(BaseMetadataSource):
     provider_name = "imdb"
+    test_url = "https://www.imdb.com"
 
     async def _create_client(self) -> httpx.AsyncClient:
         """Creates an httpx.AsyncClient with IMDb headers and proxy settings."""
@@ -84,9 +85,18 @@ class ImdbMetadataSource(BaseMetadataSource):
                         imageUrl=item.i.imageUrl if item.i else None
                     ))
                 return results
+        except httpx.ConnectError as e:
+            self.logger.error(f"IMDb API 搜索失败: 无法连接到服务器。 {e}", exc_info=True)
+            raise HTTPException(status_code=503, detail="无法连接到 IMDb 服务，请检查网络或代理设置。")
+        except httpx.TimeoutException as e:
+            self.logger.error(f"IMDb API 搜索失败: 请求超时。 {e}", exc_info=True)
+            raise HTTPException(status_code=504, detail="连接 IMDb 服务超时。")
+        except httpx.HTTPStatusError as e:
+            self.logger.error(f"IMDb API 搜索失败: HTTP 状态码 {e.response.status_code}。响应: {e.response.text[:200]}", exc_info=True)
+            raise HTTPException(status_code=502, detail=f"IMDb 服务返回错误状态码: {e.response.status_code}")
         except Exception as e:
             self.logger.error(f"IMDb API 搜索失败: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="IMDb API 搜索失败。")
+            raise HTTPException(status_code=500, detail=f"IMDb API 搜索失败: {e}")
 
     async def get_details(self, item_id: str, user: models.User, mediaType: Optional[str] = None) -> Optional[models.MetadataDetailsResponse]:
         self.logger.info(f"IMDb: 正在获取详情 item_id={item_id}")
@@ -174,11 +184,24 @@ class ImdbMetadataSource(BaseMetadataSource):
 
     async def check_connectivity(self) -> str:
         try:
+            # 修正：在创建客户端之前就确定是否使用代理，以避免AttributeError
+            proxy_url = await self.config_manager.get("proxy_url", "")
+            proxy_enabled_globally = (await self.config_manager.get("proxy_enabled", "false")).lower() == 'true'
+            async with self._session_factory() as session:
+                metadata_settings = await crud.get_all_metadata_source_settings(session)
+            provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
+            use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+            is_using_proxy = proxy_enabled_globally and use_proxy_for_this_provider and proxy_url
+            if is_using_proxy:
+                self.logger.debug(f"IMDb: 连接性检查将使用代理: {proxy_url}")
             async with await self._create_client() as client:
                 response = await client.get("https://www.imdb.com", timeout=10.0)
-                return "连接成功" if response.status_code == 200 else f"连接失败 (状态码: {response.status_code})"
+                if response.status_code == 200:
+                    return "通过代理连接成功" if is_using_proxy else "连接成功"
+                else:
+                    return f"通过代理连接失败 ({response.status_code})" if is_using_proxy else f"连接失败 ({response.status_code})"
         except Exception as e:
-            return f"连接失败: {e}"
+            return f"连接失败: {e}" # 代理信息已包含在异常中
 
     async def execute_action(self, action_name: str, payload: Dict, user: models.User) -> Any:
         """IMDb source does not support custom actions."""

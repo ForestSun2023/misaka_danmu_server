@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives import hashes, serialization, asymmetric
 
 from .scrapers.base import BaseScraper
 from .config_manager import ConfigManager
-from .models import ProviderSearchInfo
+from .models import ProviderSearchInfo, ScraperSetting
 from . import crud
 
 if TYPE_CHECKING:
@@ -65,27 +65,6 @@ class ScraperManager:
         except Exception as e:
             logging.getLogger(__name__).error(f"加载公钥失败: {e}", exc_info=True)
             self._public_key = None
-    def _load_scrapers(self):
-        """
-        动态发现并加载 'scrapers' 目录下的所有搜索源类。
-        """
-        scrapers_dir = Path(__file__).parent / "scrapers"
-        for file in scrapers_dir.glob("*.py"):
-            if file.name.startswith("_") or file.name == "base.py":
-                continue
-
-            module_name = f".scrapers.{file.stem}"
-            try:
-                module = importlib.import_module(module_name, package="src")
-                for name, obj in inspect.getmembers(module, inspect.isclass):
-                    if issubclass(obj, BaseScraper) and obj is not BaseScraper:
-                        scraper_instance = obj()
-                        if scraper_instance.provider_name in self.scrapers:
-                            print(f"警告: 发现重复的搜索源 '{scraper_instance.provider_name}'。将被覆盖。")
-                        self.scrapers[scraper_instance.provider_name] = scraper_instance
-                        print(f"搜索源 '{scraper_instance.provider_name}' 已加载。")
-            except Exception as e:
-                print(f"从 {file.name} 加载搜索源失败: {e}")
     
     async def load_and_sync_scrapers(self):
         """
@@ -170,12 +149,21 @@ class ScraperManager:
             await self.config_manager.register_defaults(default_configs_to_register)
             logging.getLogger(__name__).info(f"已为 {len(default_configs_to_register)} 个搜索源注册默认分集黑名单。")
 
-        # 新增：在同步新搜索源之前，先从数据库中移除不再存在的过时搜索源。
+        # 修正：重构同步逻辑以确保 'custom' 源始终存在，并防止意外删除。
         async with self._session_factory() as session:
-            await crud.remove_stale_scrapers(session, discovered_providers)
-        
-        async with self._session_factory() as session:
-            await crud.sync_scrapers_to_db(session, discovered_providers)
+            # 1. 仅当发现基于文件的搜索源时，才清理过时的条目。
+            #    这是一个安全措施，防止在发现过程失败时意外清空数据库。
+            #    我们总是将 'custom' 添加到要保留的列表中。
+            if discovered_providers:
+                providers_to_keep = discovered_providers + ['custom']
+                await crud.remove_stale_scrapers(session, providers_to_keep)
+            
+            # 2. 确保所有发现的搜索源和 'custom' 源都存在于数据库中。
+            #    这会添加任何新的搜索源，包括首次添加 'custom'。
+            providers_to_sync = discovered_providers + ['custom']
+            await crud.sync_scrapers_to_db(session, providers_to_sync)
+
+            # 3. 重新加载所有设置。
             settings_list = await crud.get_all_scraper_settings(session)
         self.scraper_settings = {s['providerName']: s for s in settings_list}
 
@@ -209,6 +197,21 @@ class ScraperManager:
             logging.getLogger(__name__).info("搜索源签名验证已禁用。所有搜索源将被视为已验证。")
 
         await self.load_and_sync_scrapers()
+
+    async def update_settings(self, settings: List[ScraperSetting]):
+        """
+        更新多个搜索源的设置，并立即重新加载以使更改生效。
+        这是更新设置的正确方式，因为它能确保内存中的缓存失效。
+        """
+        async with self._session_factory() as session:
+            # CRUD函数负责处理更新逻辑并提交事务。
+            await crud.update_scrapers_settings(session, settings)
+        
+        # 更新数据库后，重新加载所有搜索源以应用新设置。
+        # 这能确保启用/禁用、代理设置等立即生效。
+        await self.load_and_sync_scrapers()
+        # 使用标准日志记录器
+        logging.getLogger(__name__).info("搜索源设置已更新并重新加载。")
 
     @property
     def has_enabled_scrapers(self) -> bool:
