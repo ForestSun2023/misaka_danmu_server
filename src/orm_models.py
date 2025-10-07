@@ -112,8 +112,9 @@ class MetadataSource(Base):
     isEnabled: Mapped[bool] = mapped_column("is_enabled", Boolean, default=True)
     isAuxSearchEnabled: Mapped[bool] = mapped_column("is_aux_search_enabled", Boolean, default=True)
     displayOrder: Mapped[int] = mapped_column("display_order", Integer, default=0)
-    useProxy: Mapped[bool] = mapped_column("use_proxy", Boolean, default=False)
+    useProxy: Mapped[bool] = mapped_column("use_proxy", Boolean, default=True)
     isFailoverEnabled: Mapped[bool] = mapped_column("is_failover_enabled", Boolean, default=False)
+    logRawResponses: Mapped[bool] = mapped_column("log_raw_responses", Boolean, default=False, nullable=False)
 
 class AnimeMetadata(Base):
     __tablename__ = "anime_metadata"
@@ -230,6 +231,19 @@ class ScheduledTask(Base):
     lastRunAt: Mapped[Optional[datetime]] = mapped_column("last_run_at", NaiveDateTime)
     nextRunAt: Mapped[Optional[datetime]] = mapped_column("next_run_at", NaiveDateTime)
 
+class WebhookTask(Base):
+    __tablename__ = "webhook_tasks"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    receptionTime: Mapped[datetime] = mapped_column("reception_time", NaiveDateTime, index=True)
+    executeTime: Mapped[datetime] = mapped_column("execute_time", NaiveDateTime, index=True)
+    webhookSource: Mapped[str] = mapped_column("webhook_source", String(50))
+    status: Mapped[str] = mapped_column(String(50), default="pending", index=True) # pending, processing, failed, submitted
+    payload: Mapped[str] = mapped_column(TEXT().with_variant(MEDIUMTEXT, "mysql"))
+    uniqueKey: Mapped[str] = mapped_column("unique_key", String(255), unique=True)
+    taskTitle: Mapped[str] = mapped_column("task_title", String(255))
+
+    __table_args__ = (Index('idx_status_execute_time', 'status', 'execute_time'),)
+
 class TaskHistory(Base):
     __tablename__ = "task_history"
     # 修正：将Python属性名从 'id' 改为 'taskId'，以匹配Pydantic模型，同时保持数据库列名为 'id'
@@ -246,6 +260,17 @@ class TaskHistory(Base):
 
     __table_args__ = (Index('idx_created_at', 'created_at'),)
 
+class TaskStateCache(Base):
+    """任务状态缓存表，用于存储正在执行任务的参数，支持服务重启后的任务恢复"""
+    __tablename__ = "task_state_cache"
+    taskId: Mapped[str] = mapped_column("task_id", String(100), primary_key=True)
+    taskType: Mapped[str] = mapped_column("task_type", String(100))  # 任务类型，如 'generic_import', 'match_fallback'
+    taskParameters: Mapped[str] = mapped_column("task_parameters", TEXT().with_variant(MEDIUMTEXT, "mysql"))  # JSON格式的任务参数
+    createdAt: Mapped[datetime] = mapped_column("created_at", NaiveDateTime)
+    updatedAt: Mapped[datetime] = mapped_column("updated_at", NaiveDateTime)
+
+    __table_args__ = (Index('idx_task_type', 'task_type'),)
+
 class ExternalApiLog(Base):
     __tablename__ = "external_api_logs"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -260,3 +285,12 @@ class RateLimitState(Base):
     providerName: Mapped[str] = mapped_column("provider_name", String(50), primary_key=True)
     requestCount: Mapped[int] = mapped_column("request_count", Integer, default=0)
     lastResetTime: Mapped[datetime] = mapped_column("last_reset_time", NaiveDateTime)
+
+class TitleRecognition(Base):
+    """识别词配置表 - 单记录全量存储"""
+    __tablename__ = "title_recognition"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    content: Mapped[str] = mapped_column(TEXT().with_variant(MEDIUMTEXT, "mysql"))
+    created_at: Mapped[datetime] = mapped_column("created_at", NaiveDateTime, default=get_now)
+    updated_at: Mapped[datetime] = mapped_column("updated_at", NaiveDateTime, default=get_now, onupdate=get_now)

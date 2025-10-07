@@ -25,7 +25,11 @@ import {
   Space,
 } from 'antd'
 import { useAtom } from 'jotai'
-import { lastSearchResultAtom, searchLoadingAtom } from '../../../../store'
+import {
+  isMobileAtom,
+  lastSearchResultAtom,
+  searchLoadingAtom,
+} from '../../../../store'
 import {
   CheckOutlined,
   CloseCircleOutlined,
@@ -73,6 +77,8 @@ export const SearchResult = () => {
   const [searchTmdbLoading, setSearchTmdbLoading] = useState(false)
   const [tmdbOpen, setTmdbOpen] = useState(false)
 
+  const [isMobile] = useAtom(isMobileAtom)
+
   const [searchLoading] = useAtom(searchLoadingAtom)
   const [lastSearchResultData] = useAtom(lastSearchResultAtom)
 
@@ -92,6 +98,7 @@ export const SearchResult = () => {
   const [editConfirmLoading, setEditConfirmLoading] = useState(false)
   const [range, setRange] = useState([1, 1])
   const [episodePageSize, setEpisodePageSize] = useState(10)
+  const [episodeOrder, setEpisodeOrder] = useState('asc') // 新增：排序状态
 
   const sensors = useSensors(
     useSensor(MouseSensor, {
@@ -107,7 +114,9 @@ export const SearchResult = () => {
     })
   )
 
-  const searchSeason = lastSearchResultData?.season
+  const searchSeason = lastSearchResultData?.search_season
+  const searchEpisode = lastSearchResultData?.search_episode
+  const supplementalResults = lastSearchResultData?.supplemental_results || []
 
   const [loading, setLoading] = useState(false)
 
@@ -479,6 +488,72 @@ export const SearchResult = () => {
     )
   }
 
+  // 新增：切换排序的处理函数
+  const handleToggleOrder = () => {
+    const newOrder = episodeOrder === 'asc' ? 'desc' : 'asc'
+    setEpisodeOrder(newOrder)
+
+    setEditEpisodeList(list => {
+      const sortedList = [...list].sort((a, b) => {
+        if (newOrder === 'asc') {
+          return a.episodeIndex - b.episodeIndex
+        } else {
+          return b.episodeIndex - a.episodeIndex
+        }
+      })
+      return sortedList
+    })
+  }
+
+  // 补充搜索
+  const supplementDom = item => {
+    if (item.episodeCount === 0) {
+      const calculateSimilarity = (str1, str2) => {
+        if (!str1 || !str2) return 0
+        const s1 = str1.toLowerCase().trim()
+        const s2 = str2.toLowerCase().trim()
+        if (s1 === s2) return 100
+        if (s1.includes(s2) || s2.includes(s1)) return 85
+        // 简单的词汇匹配
+        const words1 = s1.split(/\s+/)
+        const words2 = s2.split(/\s+/)
+        const commonWords = words1.filter(word => words2.includes(word))
+        return (
+          (commonWords.length / Math.max(words1.length, words2.length)) * 100
+        )
+      }
+
+      const best_supplement = supplementalResults.find(
+        sup =>
+          sup.provider !== item.provider &&
+          calculateSimilarity(item.title, sup.title) > 80
+      )
+
+      if (best_supplement) {
+        return (
+          <div className="mt-2 p-2 bg-gray-100 dark:bg-gray-700 rounded-md flex items-center gap-2 flex-wrap justify-start">
+            <Tag color="purple">{best_supplement.provider}</Tag>
+            <span className="text-sm text-gray-500 dark:text-gray-400 shrink-0">
+              找到补充源: {best_supplement.title}
+            </span>
+            <Button
+              size="small"
+              type="link"
+              onClick={e => {
+                e.stopPropagation() // 防止触发外层的选择事件
+                handleImportDanmu(best_supplement)
+              }}
+            >
+              使用此源导入
+            </Button>
+          </div>
+        )
+      }
+      return null
+    }
+    return null
+  }
+
   return (
     <div className="my-4">
       <Card title="搜索结果" loading={searchLoading}>
@@ -621,9 +696,18 @@ export const SearchResult = () => {
                               <Tag color="gold">
                                 总集数：{item.episodeCount ?? 0}
                               </Tag>
+                              {searchEpisode && (
+                                <Tag color="cyan">
+                                  单集获取：{searchEpisode}
+                                </Tag>
+                              )}
                             </div>
+                            {!isMobile && <>{supplementDom(item)}</>}
                           </div>
                         </div>
+                        {isMobile && (
+                          <div className="mt-3">{supplementDom(item)}</div>
+                        )}
                       </Col>
                       <Col md={4} xs={12}>
                         <Button
@@ -808,6 +892,29 @@ export const SearchResult = () => {
         cancelText="取消"
         okText="确认导入"
         onCancel={() => setEditImportOpen(false)}
+        footer={[
+          <Button
+            key="order"
+            type={episodeOrder === 'asc' ? 'default' : 'primary'}
+            onClick={handleToggleOrder}
+            style={{ float: 'left' }}
+          >
+            {episodeOrder === 'asc' ? '正序' : '倒序'}
+          </Button>,
+          <Button key="cancel" onClick={() => setEditImportOpen(false)}>
+            取消
+          </Button>,
+          <Button
+            key="submit"
+            type="primary"
+            loading={editConfirmLoading}
+            onClick={() => {
+              handleImportEdit()
+            }}
+          >
+            确认导入
+          </Button>,
+        ]}
       >
         <div className="flex item-wrap md:flex-nowrap justify-between items-center gap-3 my-6">
           <div className="shrink-0">作品标题:</div>
@@ -992,17 +1099,14 @@ const SortableItem = ({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    cursor: 'grab',
-    touchAction: 'none', // 关键：阻止浏览器默认触摸行为
-    userSelect: 'none', // 防止拖拽时选中文本
     ...(isDragging && { cursor: 'grabbing' }),
   }
 
   return (
-    <List.Item ref={setNodeRef} style={style} {...attributes}>
+    <List.Item ref={setNodeRef} style={style}>
       {/* 保留你原有的列表项渲染逻辑 */}
       <div className="w-full flex items-center justify-between">
-        <div {...listeners} style={{ cursor: 'grab' }}>
+        <div {...attributes} {...listeners} style={{ cursor: 'grab' }}>
           <MyIcon icon="drag" size={24} />
         </div>
         <div className="w-full flex items-center justify-start gap-3">

@@ -1,12 +1,8 @@
-# --- Stage 1: Build Frontend ---
+# --- Stage 1: Extract SO files ---
+FROM l429609201/so:latest AS so-extractor
+
+# --- Stage 2: Build Frontend ---
 FROM node:20-alpine AS builder
-
-# 接收来自 docker build 命令的密钥参数
-ARG XOR_KEY_SECRET
-ENV XOR_KEY_SECRET=${XOR_KEY_SECRET}
-
-# 安装 Python 和编译依赖
-RUN apk add --no-cache python3 py3-pip build-base python3-dev
 
 WORKDIR /app/web
 
@@ -14,67 +10,67 @@ WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 
-# 复制所有源代码
+# 复制前端源代码
 COPY web/ ./
-COPY src/ ./src/
-COPY requirements.txt .
 
-# 安装 Python 依赖和 Nuitka
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt nuitka
-
-# 在编译前，将占位符替换为真实的密钥
-RUN if [ -z "$XOR_KEY_SECRET" ]; then echo "错误：必须提供 XOR_KEY_SECRET 构建参数！" && exit 1; fi \
-    && sed -i "s|__XOR_KEY_PLACEHOLDER__|${XOR_KEY_SECRET}|g" src/rate_limiter.py
-
-# 编译 rate_limiter.py
-# --module: 编译为 .so 模块
-# --output-dir: 指定输出目录
-RUN python3 -m nuitka --module src/rate_limiter.py --output-dir=src/
- 
 # 执行构建
 RUN npm run build
 
-# --- Stage 2: Final Python Application ---
-FROM l429609201/su-exec:su-exec
+# --- Stage 3: Python Dependency Builder ---
+FROM l429609201/su-exec:su-exec AS python-builder
 
+# 安装编译Python包所需的构建时依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
+    libpq-dev \
+    default-libmysqlclient-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建一个目录用于存放安装的包
+WORKDIR /install
+COPY requirements.txt .
+# 将所有包安装到当前目录 (/install)
+RUN pip install --no-cache-dir -r requirements.txt --target .
+
+# --- Stage 4: Final Python Application ---
+FROM l429609201/su-exec:su-exec
 
 # 设置环境变量，防止生成 .pyc 文件并启用无缓冲输出
 # 设置时区为亚洲/上海，以确保日志等时间正确显示
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV TZ="Asia/Shanghai"
-ENV LANG="C.UTF-8"
-ENV LC_ALL="C.UTF-8"
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+ENV TZ=Asia/Shanghai
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8
 
 # 设置工作目录
 WORKDIR /app
 
-# 安装系统依赖并创建用户
+# 仅安装运行时的系统依赖，不再需要 build-essential, python3-dev 等
 RUN set -ex \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
-        python3-dev \
         tzdata \
         iputils-ping \
+        libmariadb3 \
+        libpq5 \
     && addgroup --gid 1000 appgroup \
     && adduser --shell /bin/sh --disabled-password --uid 1000 --gid 1000 appuser \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制依赖文件并安装
-COPY requirements.txt .
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+# 从 python-builder 阶段将安装好的包复制到系统 site-packages 目录
+# 注意：路径中的 python3.11 需要与基础镜像的Python版本匹配
+COPY --from=python-builder /install /usr/local/lib/python3.11/site-packages
+
+# 从 so-extractor 阶段复制.so文件到对应的src目录结构
+COPY --from=so-extractor /app/src/ ./src/
 
 # 复制应用代码
 COPY src/ ./src/
 COPY static/ ./static/
 COPY config/ ./config/
-# 移除 rate_limiter.py 源码
-RUN rm src/rate_limiter.py
-# 从 builder 阶段复制编译好的 .so 文件
-COPY --from=builder /app/web/src/*.so ./src/
 COPY exec.sh /exec.sh
 COPY run.sh /run.sh
 RUN chmod +x /exec.sh /run.sh

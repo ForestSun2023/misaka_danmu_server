@@ -55,13 +55,14 @@ class TvdbMetadataSource(BaseMetadataSource):
 
     async def _create_client(self) -> httpx.AsyncClient:
         # 1. 获取代理配置
-        proxy_url = await self.config_manager.get("proxy_url", "")
-        proxy_enabled_globally = (await self.config_manager.get("proxy_enabled", "false")).lower() == 'true'
-
         async with self._session_factory() as session:
+            proxy_url = await crud.get_config_value(session, "proxyUrl", "")
+            proxy_enabled_str = await crud.get_config_value(session, "proxyEnabled", "false")
+            proxy_enabled_globally = proxy_enabled_str.lower() == 'true'
             metadata_settings = await crud.get_all_metadata_source_settings(session)
         provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
-        use_proxy_for_this_provider = provider_setting.get('use_proxy', False) if provider_setting else False
+        use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+
         proxy_to_use = proxy_url if proxy_enabled_globally and use_proxy_for_this_provider and proxy_url else None
 
         # 2. 创建一个基础客户端用于登录
@@ -159,31 +160,19 @@ class TvdbMetadataSource(BaseMetadataSource):
         return set()
 
     async def check_connectivity(self) -> str:
+        """检查TVDB源配置状态"""
         try:
-            is_using_proxy = False
-            api_key = await self.config_manager.get("tvdbApiKey")
-            if not api_key:
-                return "未配置API Key"
-            proxy_url = await self.config_manager.get("proxy_url", "")
-            proxy_enabled_globally = (await self.config_manager.get("proxy_enabled", "false")).lower() == 'true'
-            async with self._session_factory() as session:
-                metadata_settings = await crud.get_all_metadata_source_settings(session)
-            provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
-            use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
-            proxy_to_use = proxy_url if proxy_enabled_globally and use_proxy_for_this_provider and proxy_url else None
-            if proxy_to_use:
-                is_using_proxy = True
-                self.logger.debug(f"TVDB: 连接性检查将使用代理: {proxy_to_use}")
+            api_key = await self.config_manager.get("tvdbApiKey", "")
+            if not api_key or api_key.strip() == "":
+                return "未配置 (缺少TVDB API Key)"
 
-            async with httpx.AsyncClient(timeout=10.0, proxy=proxy_to_use) as client:
-                response = await client.post("https://api4.thetvdb.com/v4/login", json={"apikey": api_key})
-                if response.status_code == 200:
-                    return "通过代理连接成功" if is_using_proxy else "连接成功"
-                else:
-                    return f"通过代理连接失败 ({response.status_code})" if is_using_proxy else f"连接失败 ({response.status_code})"
+            # 检查API Key格式是否合理
+            if len(api_key.strip()) < 10:
+                return "配置异常 (API Key格式不正确)"
+
+            return "配置正常"
         except Exception as e:
-            self.logger.error(f"TVDB: 连接性检查失败: {e}", exc_info=True)
-            return "连接失败" # 代理信息已包含在异常中
+            return f"配置检查失败: {e}"
     async def execute_action(self, action_name: str, payload: Dict, user: models.User) -> Any:
         """TVDB source does not support custom actions."""
         raise NotImplementedError(f"源 '{self.provider_name}' 不支持任何自定义操作。")
